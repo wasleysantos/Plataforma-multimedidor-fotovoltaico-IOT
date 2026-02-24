@@ -17,7 +17,7 @@ type Row = {
   house_consumption: any;
 };
 
-type RangeKey = "12h" | "24h" | "7d";
+type RangeKey = "24h" | "7d" | "30d";
 type Mode = "KW" | "BRL_ECON";
 
 function toNum(v: any) {
@@ -26,9 +26,9 @@ function toNum(v: any) {
 }
 
 function hoursForRange(r: RangeKey) {
-  if (r === "12h") return 12;
   if (r === "24h") return 24;
-  return 24 * 7;
+  if (r === "7d") return 24 * 7;
+  return 24 * 30; // ✅ 30 dias
 }
 
 function tsToMs(ts: string) {
@@ -49,14 +49,21 @@ function inWindow(ts: string, range: RangeKey) {
 }
 
 // ===== Formatações =====
-function fmtAxis(ts: string) {
+function fmtAxis(ts: string, range: RangeKey) {
   const d = new Date(ts);
-  if (Number.isNaN(d.getTime())) return "--/-- --:--";
+  if (Number.isNaN(d.getTime())) return "--";
+
+  // 24h: HH:MM | 7d/30d: DD/MM
+  if (range === "24h") {
+    return new Intl.DateTimeFormat("pt-BR", {
+      hour: "2-digit",
+      minute: "2-digit",
+    }).format(d);
+  }
+
   return new Intl.DateTimeFormat("pt-BR", {
     day: "2-digit",
     month: "2-digit",
-    hour: "2-digit",
-    minute: "2-digit",
   }).format(d);
 }
 
@@ -81,7 +88,7 @@ function buildSeries(points: { ts: string; genKw: number }[], tarifa: number) {
     if (i === 0) {
       return {
         ts: p.ts,
-        label: fmtAxis(p.ts),
+        label: "", // preenchido depois (depende do range)
         gen_kw: p.genKw,
         brl_econ: 0,
       };
@@ -99,7 +106,7 @@ function buildSeries(points: { ts: string; genKw: number }[], tarifa: number) {
 
     return {
       ts: p.ts,
-      label: fmtAxis(p.ts),
+      label: "", // preenchido depois (depende do range)
       gen_kw: p.genKw,
       brl_econ: Number((kwhAcum * tarifa).toFixed(2)),
     };
@@ -262,8 +269,14 @@ export function PowerChart({ cpf }: { cpf: string }) {
       genKw: Math.max(0, toNum(r.solar_generation)),
     }));
 
-    return buildSeries(points, tarifaKwh || 0);
-  }, [rows, tarifaKwh]);
+    const series = buildSeries(points, tarifaKwh || 0);
+
+    // ✅ aplica label dependente do range
+    return series.map((s) => ({
+      ...s,
+      label: fmtAxis(s.ts, range),
+    }));
+  }, [rows, tarifaKwh, range]);
 
   const ZoomButton = ({ k, label }: { k: RangeKey; label: string }) => (
     <button
@@ -319,14 +332,14 @@ export function PowerChart({ cpf }: { cpf: string }) {
 
   if (chartData.length === 0) {
     const label =
-      range === "12h" ? "12 horas" : range === "24h" ? "24 horas" : "7 dias";
+      range === "24h" ? "24 horas" : range === "7d" ? "7 dias" : "30 dias";
     return (
       <div className="h-20 flex flex-col gap-2 items-center justify-center text-gray-600 text-xs">
         <div>Sem dados nas últimas {label}.</div>
         <div className="flex gap-2">
-          <ZoomButton k="12h" label="12h" />
           <ZoomButton k="24h" label="24h" />
           <ZoomButton k="7d" label="7d" />
+          <ZoomButton k="30d" label="30d" />
         </div>
       </div>
     );
@@ -350,9 +363,9 @@ export function PowerChart({ cpf }: { cpf: string }) {
         </div>
 
         <div className="flex gap-2">
-          <ZoomButton k="12h" label="12h" />
           <ZoomButton k="24h" label="24h" />
           <ZoomButton k="7d" label="7d" />
+          <ZoomButton k="30d" label="30d" />
         </div>
       </div>
 
@@ -366,7 +379,7 @@ export function PowerChart({ cpf }: { cpf: string }) {
         <div className="text-[11px] text-gray-500 text-right">
           Período:{" "}
           <span className="text-gray-200 font-semibold">
-            {range === "12h" ? "12h" : range === "24h" ? "24h" : "7 dias"}
+            {range === "24h" ? "24h" : range === "7d" ? "7 dias" : "30 dias"}
           </span>
         </div>
       </div>
@@ -391,6 +404,7 @@ export function PowerChart({ cpf }: { cpf: string }) {
             tickLine={false}
             interval="preserveStartEnd"
           />
+
           <YAxis
             stroke="#64748b"
             style={{ fontSize: "12px" }}

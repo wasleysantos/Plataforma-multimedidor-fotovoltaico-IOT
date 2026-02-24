@@ -97,23 +97,21 @@ export function Login({
   const busy = loadingLogin || loadingGoogle;
 
   return (
-  <div className="relative w-full min-h-screen flex items-center justify-center overflow-hidden">
-    
-    {/* BACKGROUND FIXO */}
-    <div
-      className="fixed inset-0 -z-10 bg-cover bg-center bg-no-repeat"
-      style={{ backgroundImage: `url(${solarBg})` }}
-    />
+    <div className="relative w-full min-h-screen flex items-center justify-center overflow-hidden">
+      {/* BACKGROUND FIXO */}
+      <div
+        className="fixed inset-0 -z-10 bg-cover bg-center bg-no-repeat"
+        style={{ backgroundImage: `url(${solarBg})` }}
+      />
 
-    {/* Gradiente */}
-    <div className="fixed inset-0 -z-10 bg-gradient-to-br from-[#0a1628]/90 via-[#0a1628]/80 to-[#071224]/95 pointer-events-none" />
+      {/* Gradiente */}
+      <div className="fixed inset-0 -z-10 bg-gradient-to-br from-[#0a1628]/90 via-[#0a1628]/80 to-[#071224]/95 pointer-events-none" />
 
-    {/* Vinheta */}
-    <div className="fixed inset-0 -z-10 bg-[radial-gradient(circle_at_center,transparent_40%,rgba(0,0,0,0.7)_100%)] pointer-events-none" />
+      {/* Vinheta */}
+      <div className="fixed inset-0 -z-10 bg-[radial-gradient(circle_at_center,transparent_40%,rgba(0,0,0,0.7)_100%)] pointer-events-none" />
 
-    {/* Conteúdo */}
-    <div className="w-full max-w-md px-4 sm:px-6 relative z-10">
-
+      {/* Conteúdo */}
+      <div className="w-full max-w-md px-4 sm:px-6 relative z-10">
         {/* ✅ Logo + Badge com fade suave */}
         <div
           className={[

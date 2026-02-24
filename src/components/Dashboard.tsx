@@ -1,3 +1,10 @@
+// Dashboard.tsx (COMPLETO ATUALIZADO) ✅
+// - Cards alterados para: GERAÇÃO (MÊS), CONSUMO (MÊS), SALDO (MÊS) e STATUS
+// - Geração (Mês) usa monthKwh (measurements)
+// - Consumo e Saldo ficam vazios por enquanto
+// - Status (Online/Offline) mantém a lógica atual (relayState)
+// - Mantém todo o resto (monitoring, realtime/polling, toggle, etc.)
+
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
   Sun,
@@ -11,6 +18,7 @@ import {
   Plug,
   Wifi,
   WifiOff,
+  Users,
 } from "lucide-react";
 
 import { supabase } from "../lib/supabase";
@@ -21,9 +29,8 @@ import { Generation } from "./Generation";
 import { Consumption } from "./Consumption";
 import { Historic } from "./Historic";
 import { SettingsPage } from "./SettingsPage";
-
-// ✅ NOVO: sua nova página de cadastro
 import { CustomerRegisterPage } from "./CustomerRegisterPage";
+import { Monitoring } from "./Monitoring";
 
 import logoImage from "figma:asset/86a5dbd476eaf5850e2d574675b5ba3853e32186.png";
 
@@ -34,11 +41,12 @@ interface DashboardProps {
 
 type Screen =
   | "dashboard"
+  | "monitoring"
   | "generation"
   | "consumption"
   | "historic"
   | "settings"
-  | "customer_register"; // ✅ NOVO
+  | "customer_register";
 
 const normalizeCpf = (value: string) =>
   (value || "").replace(/\D/g, "").slice(0, 11);
@@ -65,10 +73,6 @@ const toNum = (v: any) => {
 function tsToMs(ts: string) {
   const ms = new Date(ts).getTime();
   return Number.isFinite(ms) ? ms : NaN;
-}
-
-function wToKw(w: number) {
-  return w / 1000;
 }
 
 function integrateKwhFromRows(
@@ -126,8 +130,9 @@ export function Dashboard({ user, onLogout }: DashboardProps) {
     status: "Offline" as "Online" | "Offline",
   });
 
-  const [dailyKwh, setDailyKwh] = useState(0);
-  const [dailyKwhError, setDailyKwhError] = useState("");
+  // ✅ AGORA É kWh DO MÊS
+  const [monthKwh, setMonthKwh] = useState(0);
+  const [monthKwhError, setMonthKwhError] = useState("");
 
   // ==============================
   // ✅ CONTROLE DO SISTEMA (device_status)
@@ -254,16 +259,13 @@ export function Dashboard({ user, onLogout }: DashboardProps) {
       : "—";
     setLastUpdate(formattedDate);
 
-    const voltage = toNum(row.voltage);
-    const current = toNum(row.current);
-
     const solarW = toNum(row.solar_generation);
     const consW = toNum(row.house_consumption);
     const netW = solarW - consW;
 
     setRealData({
-      voltage,
-      current,
+      voltage: toNum(row.voltage),
+      current: toNum(row.current),
       solarW,
       consW,
       netW,
@@ -273,38 +275,47 @@ export function Dashboard({ user, onLogout }: DashboardProps) {
     setCpfNotFound(false);
   };
 
-  const calcDailyKwh = async () => {
+  // ✅ kWh DO MÊS (do dia 1 até agora)
+  // Base correta: solar_generation (W) a cada 10s
+
+  const SAMPLE_SECONDS = 10;
+  const WH_FACTOR = SAMPLE_SECONDS / 3600; // 1/360
+
+  const calcMonthKwh = async () => {
     if (!targetCPF) return;
 
-    setDailyKwhError("");
+    setMonthKwhError("");
 
     const start = new Date();
+    start.setDate(1);
     start.setHours(0, 0, 0, 0);
 
     const { data, error } = await supabase
       .from("measurements")
-      .select("timestamp,solar_generation")
+      .select("solar_generation")
       .eq("user_cpf", targetCPF)
       .gte("timestamp", start.toISOString())
-      .order("timestamp", { ascending: true })
-      .limit(5000);
+      .limit(100000); // mês pode ter bastante leitura
 
     if (error) {
-      console.error("Erro calcDailyKwh:", error);
-      setDailyKwhError(error.message || "Erro ao calcular kWh do dia");
-      setDailyKwh(0);
+      console.error("Erro calcMonthKwh:", error);
+      setMonthKwhError(error.message || "Erro ao calcular kWh do mês");
+      setMonthKwh(0);
       return;
     }
 
-    const rows = (data || []) as { timestamp: string; solar_generation: any }[];
+    const rows = (data || []) as { solar_generation: any }[];
 
-    if (!rows || rows.length < 2) {
-      setDailyKwh(0);
-      return;
-    }
+    // 🔥 Soma correta: W → Wh → kWh
+    const totalWh = rows.reduce((acc, r) => {
+      const w = Number(r?.solar_generation);
+      const safeW = Number.isFinite(w) && w > 0 ? w : 0;
+      return acc + safeW * WH_FACTOR;
+    }, 0);
 
-    const kwh = integrateKwhFromRows(rows);
-    setDailyKwh(Number(kwh.toFixed(3)));
+    const kwh = totalWh / 1000;
+
+    setMonthKwh(Number(kwh.toFixed(3)));
   };
 
   const fetchPersonName = async () => {
@@ -354,12 +365,14 @@ export function Dashboard({ user, onLogout }: DashboardProps) {
     cpfRef.current = targetCPF;
   }, [targetCPF]);
 
-  const refreshAll = () => {
-    if (!cpfRef.current) return;
+  const refreshAllFor = (cpf: string) => {
+    if (!cpf) return;
+    cpfRef.current = cpf;
+
     fetchLatestData();
     fetchPersonName();
     fetchRelayState();
-    calcDailyKwh();
+    calcMonthKwh();
   };
 
   const handleFilter = () => {
@@ -377,7 +390,7 @@ export function Dashboard({ user, onLogout }: DashboardProps) {
     setPersonName("");
 
     if (cpfDigits === targetCPF) {
-      refreshAll();
+      refreshAllFor(cpfDigits);
       return;
     }
 
@@ -396,7 +409,7 @@ export function Dashboard({ user, onLogout }: DashboardProps) {
       setInputError(false);
 
       if (cpfDigits === targetCPF) {
-        refreshAll();
+        refreshAllFor(cpfDigits);
         return;
       }
 
@@ -419,7 +432,7 @@ export function Dashboard({ user, onLogout }: DashboardProps) {
       fetchLatestData();
       fetchPersonName();
       fetchRelayState();
-      calcDailyKwh();
+      calcMonthKwh();
 
       pollId = window.setInterval(() => {
         fetchLatestData();
@@ -427,7 +440,7 @@ export function Dashboard({ user, onLogout }: DashboardProps) {
       }, 5000);
 
       kwhPollId = window.setInterval(() => {
-        calcDailyKwh();
+        calcMonthKwh();
       }, 15000);
 
       subscription = supabase
@@ -507,8 +520,8 @@ export function Dashboard({ user, onLogout }: DashboardProps) {
       setNameNotFound(false);
       setLoadingName(false);
 
-      setDailyKwh(0);
-      setDailyKwhError("");
+      setMonthKwh(0);
+      setMonthKwhError("");
 
       setRelayState(null);
       setRelayError("");
@@ -543,6 +556,44 @@ export function Dashboard({ user, onLogout }: DashboardProps) {
 
   const renderScreen = () => {
     switch (currentScreen) {
+      case "monitoring":
+        return (
+          <Monitoring
+            cpf={targetCPF}
+            status={realData.status}
+            lastUpdate={lastUpdate}
+            voltage={realData.voltage}
+            current={realData.current}
+            solarW={realData.solarW}
+            consW={realData.consW}
+            netW={realData.netW}
+            relayState={relayState}
+            onSelectCpf={(cpf) => {
+              const clean = normalizeCpf(cpf);
+              if (clean.length !== 11) return;
+
+              setSearchInput(maskCPF(clean));
+              setInputError(false);
+              setCpfNotFound(false);
+              setDbError("");
+              setNameNotFound(false);
+              setPersonName("");
+
+              setTargetCPF(clean);
+
+              cpfRef.current = clean;
+              queueMicrotask(() => {
+                fetchLatestData();
+                fetchPersonName();
+                fetchRelayState();
+                calcMonthKwh();
+              });
+
+              setMenuOpen(false);
+            }}
+          />
+        );
+
       case "generation":
         return <Generation cpf={targetCPF} />;
 
@@ -572,15 +623,18 @@ export function Dashboard({ user, onLogout }: DashboardProps) {
               setDbError("");
               setTargetCPF(clean);
             }}
-            // ✅ NOVO: navega pra tela de cadastro
-            onNavigate={(page) => {
+            onNavigate={(page: any) => {
+              if (page === "dashboard") {
+                setCurrentScreen("dashboard");
+                setMenuOpen(false);
+                return;
+              }
               setCurrentScreen(page);
               setMenuOpen(false);
             }}
           />
         );
 
-      // ✅ NOVO: tela dedicada de cadastro
       case "customer_register":
         return (
           <CustomerRegisterPage
@@ -594,9 +648,6 @@ export function Dashboard({ user, onLogout }: DashboardProps) {
       default:
         return (
           <>
-            {/* ... seu dashboard padrão (sem mudanças) ... */}
-            {/* (mantive exatamente como está no seu código) */}
-
             {/* Filtro CPF */}
             <div className="mb-4">
               <div className="flex gap-3 items-center justify-center">
@@ -644,66 +695,81 @@ export function Dashboard({ user, onLogout }: DashboardProps) {
               )}
             </div>
 
-            {/* CPF + Nome + Última atualização + Relógio */}
-            <div className="mb-3 flex items-start justify-between gap-3">
-              <div className="text-left">
-                <div className="text-xs text-gray-400">
-                  Monitorando por CPF:
-                </div>
-                <div className="text-sm font-semibold text-green-400">
-                  {targetCPF ? maskCPF(targetCPF) : "Aguardando CPF..."}
+            {/* 📌 Monitoramento - CPF + Nome + Atualização + Relógio */}
+            <div className="mb-4 rounded-2xl bg-zinc-900/60 border border-zinc-800 p-4 backdrop-blur-md shadow-lg">
+              <div className="flex items-center justify-between gap-4">
+                {/* 🔎 Lado esquerdo */}
+                <div className="flex flex-col space-y-1">
+                  <span className="text-[11px] suppercase tracking-wider text-gray-300">
+                    Monitorando:
+                  </span>
+
+                  <div className="flex items-center gap-2">
+                    <span className="text-base font-semibold text-gray-300">
+                      CPF:
+                    </span>
+                    <span className="text-base font-semibold text-green-400">
+                      {targetCPF ? maskCPF(targetCPF) : "Aguardando CPF..."}
+                    </span>
+                  </div>
+
+                  {targetCPF && (
+                    <>
+                      <div className="text-sm text-green-400">
+                        {loadingName
+                          ? "Carregando nome..."
+                          : personName
+                            ? personName
+                            : nameNotFound
+                              ? "CPF não encontrado"
+                              : ""}
+                      </div>
+
+                      <div className="flex items-center gap-1 text-[11px] text-gray-400">
+                        <span className="w-2 h-2 rounded-full bg-green-500 animate-pulse"></span>
+                        Última atualização:
+                        <span className="text-gray-300 font-medium text-green-400">
+                          {lastUpdate}
+                        </span>
+                      </div>
+                    </>
+                  )}
                 </div>
 
-                {targetCPF && (
-                  <>
-                    <div className="text-xs text-gray-300 mt-0.5">
-                      {loadingName
-                        ? "Carregando nome..."
-                        : personName
-                          ? personName
-                          : nameNotFound
-                            ? "CPF não encontrado"
-                            : ""}
-                    </div>
-
-                    <div className="text-[11px] text-gray-500 mt-1">
-                      Última atualização:{" "}
-                      <span className="text-gray-300">{lastUpdate}</span>
-                    </div>
-                  </>
-                )}
-              </div>
-
-              <div className="text-right text-gray-300">
-                <div className="text-xl font-bold leading-tight">
-                  {timeText}
-                </div>
-                <div className="text-xs text-gray-400 capitalize">
-                  {dateText}
+                {/* 🕒 Lado direito - Relógio */}
+                <div className="text-right">
+                  <div className="text-2xl font-bold text-white tracking-tight">
+                    {timeText}
+                  </div>
+                  <div className="text-xs text-gray-400 capitalize">
+                    {dateText}
+                  </div>
                 </div>
               </div>
             </div>
-
-            {/* Cards */}
-            <div className="grid grid-cols-2 sm:grid-cols-3 gap-2 mb-4">
+            {/* ✅ CARDS (MÊS): Geração/Consumo/Saldo/Status */}
+            <div className="grid grid-cols-2 md:grid-cols-4 gap-2 mb-3">
               <MetricsCard
                 icon={<Sun className="w-4 h-4" />}
-                label="Geração (Hoje)"
-                value={`${dailyKwh.toFixed(2)} kWh`}
+                label="Geração (Mês)"
+                value={`${monthKwh.toFixed(2)} kWh`}
                 color="green"
               />
-              <MetricsCard
-                icon={<Zap className="w-4 h-4" />}
-                label="Potência Solar"
-                value={`${wToKw(realData.solarW).toFixed(3)} kW`}
-                color="red"
-              />
+
               <MetricsCard
                 icon={<Plug className="w-4 h-4" />}
-                label="Tensão"
-                value={`${realData.voltage.toFixed(1)} V`}
+                label="Consumo (Mês)"
+                value={"—"}
                 color="yellow"
               />
+
+              <MetricsCard
+                icon={<Zap className="w-4 h-4" />}
+                label="Saldo (Mês)"
+                value={"—"}
+                color="blue"
+              />
+
               <MetricsCard
                 icon={
                   relayState === null ? (
@@ -731,10 +797,10 @@ export function Dashboard({ user, onLogout }: DashboardProps) {
               />
             </div>
 
-            {dailyKwhError && (
+            {monthKwhError && (
               <div className="flex items-center gap-1 -mt-2 mb-3 text-yellow-400 text-[10px] font-bold uppercase tracking-wider">
                 <AlertCircle className="w-3 h-3" />
-                kWh do dia: {dailyKwhError}
+                kWh do mês: {monthKwhError}
               </div>
             )}
 
@@ -907,6 +973,21 @@ export function Dashboard({ user, onLogout }: DashboardProps) {
               >
                 <History className="w-5 h-5" />
                 Histórico
+              </button>
+
+              <button
+                onClick={() => {
+                  setCurrentScreen("monitoring");
+                  setMenuOpen(false);
+                }}
+                className={`w-full flex items-center gap-3 px-4 py-3 rounded-lg transition-colors ${
+                  currentScreen === "monitoring"
+                    ? "bg-green-500/20 text-green-400"
+                    : "text-gray-300 hover:bg-[#0a1628]"
+                }`}
+              >
+                <Users className="w-5 h-5" />
+                Monitoramento
               </button>
 
               <button

@@ -1,3 +1,12 @@
+// Historic.tsx (COMPLETO ATUALIZADO) ✅
+// NOVA BASE (igual ao Generation atualizado):
+// - solar_generation = potência em W (amostra a cada 10s)
+// - Wh por amostra = W * (10/3600) = W/360
+// - kWh do período/dia = soma(Wh)/1000
+// - NÃO usa mais solar_generation_wh no cálculo (pode continuar exibindo se quiser, mas aqui removi do select e do PDF/lista)
+// - Consumo/saldo mantidos por integração (W->kWh) usando timestamps (para não quebrar)
+// - Lista por horário segue exibindo POTÊNCIA em W
+
 import { useEffect, useMemo, useState } from "react";
 import { supabase } from "../lib/supabase";
 import {
@@ -13,8 +22,6 @@ import jsPDF from "jspdf";
 
 interface HistoricProps {
   cpf: string;
-
-  // ✅ liga o histórico com as páginas/abas do seu app (sem react-router-dom)
   onNavigate?: (page: "generation" | "consumption") => void;
 }
 
@@ -31,7 +38,6 @@ function tsToMs(ts: string) {
 }
 
 function fmtDateKey(ts: string) {
-  // YYYY-MM-DD (local)
   const d = new Date(ts);
   if (Number.isNaN(d.getTime())) return "invalid";
   const yyyy = d.getFullYear();
@@ -70,20 +76,24 @@ function startIsoForRange(range: RangeKey) {
   return new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString();
 }
 
-// ✅ Integra kW -> kWh (trapézio)
-// (assumindo solar_generation e house_consumption em kW no banco)
-function integrateKwh(itemsAsc: any[]) {
-  if (!itemsAsc || itemsAsc.length < 2) {
-    const only = itemsAsc?.[0];
-    return {
-      genKwh: 0,
-      consKwh: 0,
-      saldoKwh: 0,
-      lastVoltage: toNum(only?.voltage),
-    };
-  }
+// ✅ base fixa: amostra a cada 10 segundos
+const SAMPLE_SECONDS = 10;
+const WH_FACTOR = SAMPLE_SECONDS / 3600; // 1/360
 
-  let genKwh = 0;
+// ✅ GERAÇÃO: soma potência (W) -> Wh do intervalo -> kWh
+function sumGenKwhFromW(items: any[]) {
+  const totalWh = (items || []).reduce((acc, it) => {
+    const w = Math.max(0, toNum(it?.solar_generation));
+    return acc + w * WH_FACTOR;
+  }, 0);
+
+  return totalWh / 1000;
+}
+
+// ✅ CONSUMO: integra W -> kWh (trapézio) pelos timestamps (mantém seu comportamento anterior)
+function integrateConsKwhFromW(itemsAsc: any[]) {
+  if (!itemsAsc || itemsAsc.length < 2) return 0;
+
   let consKwh = 0;
 
   for (let i = 1; i < itemsAsc.length; i++) {
@@ -96,35 +106,24 @@ function integrateKwh(itemsAsc: any[]) {
 
     const dtHours = Math.max(0, (t1 - t0) / (1000 * 60 * 60));
 
-    const g0 = Math.max(0, toNum(prev.solar_generation));
-    const g1 = Math.max(0, toNum(curr.solar_generation));
-    const c0 = Math.max(0, toNum(prev.house_consumption));
-    const c1 = Math.max(0, toNum(curr.house_consumption));
+    // W -> kW
+    const c0kw = Math.max(0, toNum(prev.house_consumption)) / 1000;
+    const c1kw = Math.max(0, toNum(curr.house_consumption)) / 1000;
 
-    genKwh += ((g0 + g1) / 2) * dtHours;
-    consKwh += ((c0 + c1) / 2) * dtHours;
+    consKwh += ((c0kw + c1kw) / 2) * dtHours;
   }
 
-  const saldoKwh = genKwh - consKwh;
-
-  return {
-    genKwh,
-    consKwh,
-    saldoKwh,
-    lastVoltage: toNum(itemsAsc[itemsAsc.length - 1]?.voltage),
-  };
+  return consKwh;
 }
 
-const FALLBACK_TARIFA = 0.85; // ajuste se quiser
+const FALLBACK_TARIFA = 0.85;
 
 export function Historic({ cpf, onNavigate }: HistoricProps) {
   const [history, setHistory] = useState<any[]>([]);
   const [loading, setLoading] = useState(true);
 
-  // ✅ filtro de período
   const [range, setRange] = useState<RangeKey>("7d");
 
-  // ✅ nome + tarifa do cliente
   const [personName, setPersonName] = useState("");
   const [nameNotFound, setNameNotFound] = useState(false);
   const [loadingName, setLoadingName] = useState(false);
@@ -132,7 +131,6 @@ export function Historic({ cpf, onNavigate }: HistoricProps) {
   const [tarifaKwh, setTarifaKwh] = useState<number>(FALLBACK_TARIFA);
   const [tarifaError, setTarifaError] = useState("");
 
-  // ✅ busca nome + tarifa no customers
   useEffect(() => {
     const fetchCustomer = async () => {
       if (!cpf) {
@@ -184,7 +182,6 @@ export function Historic({ cpf, onNavigate }: HistoricProps) {
     fetchCustomer();
   }, [cpf]);
 
-  // ✅ busca histórico (measurements) conforme range
   useEffect(() => {
     const fetchHistory = async () => {
       if (!cpf) {
@@ -197,13 +194,14 @@ export function Historic({ cpf, onNavigate }: HistoricProps) {
 
       const since = startIsoForRange(range);
 
+      // ✅ agora só precisamos de solar_generation (W) + consumo/tensão
       const { data, error } = await supabase
         .from("measurements")
-        .select("*")
+        .select("id,timestamp,voltage,solar_generation,house_consumption")
         .eq("user_cpf", cpf)
         .gte("timestamp", since)
         .order("timestamp", { ascending: false })
-        .limit(2000);
+        .limit(10000);
 
       if (error) {
         console.error("Historic measurements error:", error);
@@ -219,7 +217,37 @@ export function Historic({ cpf, onNavigate }: HistoricProps) {
     fetchHistory();
   }, [cpf, range]);
 
-  // ✅ Agrupa por data + calcula resumo diário + R$
+  // ✅ total do período (cards topo)
+  const periodTotals = useMemo(() => {
+    if (!history || history.length === 0) {
+      return { genKwh: 0, consKwh: 0, saldoKwh: 0, lastVoltage: 0 };
+    }
+
+    // ✅ geração pelo W (10s) -> kWh
+    const genKwh = sumGenKwhFromW(history);
+
+    // ✅ consumo por integração (W->kWh)
+    const asc = [...history].sort(
+      (a, b) =>
+        new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime(),
+    );
+    const consKwh = integrateConsKwhFromW(asc);
+
+    const saldoKwh = genKwh - consKwh;
+
+    return {
+      genKwh,
+      consKwh,
+      saldoKwh,
+      lastVoltage: toNum(history?.[0]?.voltage),
+    };
+  }, [history]);
+
+  const periodEconBrl = useMemo(() => {
+    return periodTotals.genKwh * (tarifaKwh || 0);
+  }, [periodTotals.genKwh, tarifaKwh]);
+
+  // ✅ Agrupa por data + resumo diário
   const grouped = useMemo(() => {
     const map = new Map<string, any[]>();
 
@@ -237,17 +265,24 @@ export function Historic({ cpf, onNavigate }: HistoricProps) {
           new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime(),
       );
 
-      const dayItemsAsc = [...dayItemsDesc].reverse();
-      const sum = integrateKwh(dayItemsAsc);
+      // ✅ geração diária pelo W (10s) -> kWh
+      const genKwh = sumGenKwhFromW(dayItemsDesc);
 
-      const econBrl = sum.genKwh * (tarifaKwh || 0);
+      // ✅ consumo diário por integração (W->kWh)
+      const dayItemsAsc = [...dayItemsDesc].reverse();
+      const consKwh = integrateConsKwhFromW(dayItemsAsc);
+
+      const saldoKwh = genKwh - consKwh;
+      const econBrl = genKwh * (tarifaKwh || 0);
 
       return {
         dateKey: k,
         title: fmtDateHeader(k),
         items: dayItemsDesc,
         summary: {
-          ...sum,
+          genKwh,
+          consKwh,
+          saldoKwh,
           econBrl,
         },
       };
@@ -272,9 +307,9 @@ export function Historic({ cpf, onNavigate }: HistoricProps) {
   const exportToPDF = () => {
     const doc = new jsPDF();
     doc.setFontSize(16);
-    doc.text("Relatório de Energia - Laboratório Tesla", 14, 20);
+    doc.text("Relatório de Energia - Tesla Solar", 14, 20);
     doc.setFontSize(10);
-    doc.text(`Cliente CPF: ${cpf}`, 14, 30);
+    doc.text(`CPF: ${cpf}`, 14, 30);
     if (personName) doc.text(`Cliente: ${personName}`, 14, 36);
 
     const rangeLabel =
@@ -287,7 +322,19 @@ export function Historic({ cpf, onNavigate }: HistoricProps) {
       personName ? 48 : 42,
     );
 
-    let y = personName ? 60 : 54;
+    doc.text(
+      `Total período: Gerado ${periodTotals.genKwh.toFixed(
+        2,
+      )} kWh | Consumido ${periodTotals.consKwh.toFixed(
+        2,
+      )} kWh | Saldo ${periodTotals.saldoKwh.toFixed(
+        2,
+      )} kWh | Economizado R$ ${periodEconBrl.toFixed(2)}`,
+      14,
+      personName ? 54 : 48,
+    );
+
+    let y = personName ? 66 : 60;
 
     grouped.forEach((g) => {
       doc.setFontSize(12);
@@ -296,7 +343,9 @@ export function Historic({ cpf, onNavigate }: HistoricProps) {
 
       doc.setFontSize(10);
       doc.text(
-        `Resumo: Gerado ${g.summary.genKwh.toFixed(2)} kWh | Consumido ${g.summary.consKwh.toFixed(
+        `Resumo: Gerado ${g.summary.genKwh.toFixed(
+          2,
+        )} kWh | Consumido ${g.summary.consKwh.toFixed(
           2,
         )} kWh | Saldo ${g.summary.saldoKwh.toFixed(
           2,
@@ -315,13 +364,17 @@ export function Historic({ cpf, onNavigate }: HistoricProps) {
           second: "2-digit",
         });
 
-        const gen = toNum(item.solar_generation);
-        const cons = toNum(item.house_consumption);
+        const potW = Math.max(0, toNum(item.solar_generation));
         const tens = toNum(item.voltage);
-        const saldo = (gen - cons).toFixed(2);
+        const consW = Math.max(0, toNum(item.house_consumption));
+
+        // ✅ energia do intervalo calculada (Wh) pela base fixa de 10s
+        const enerWh = potW * WH_FACTOR;
 
         doc.text(
-          `${hora} | Tens: ${tens}V | Gen: ${gen}kW | Cons: ${cons}kW | Saldo: ${saldo}kW`,
+          `${hora} | Tens: ${tens}V | Pot: ${potW.toFixed(
+            0,
+          )}W | Ener: ${enerWh.toFixed(2)}Wh | Cons: ${consW.toFixed(0)}W`,
           14,
           y,
         );
@@ -340,10 +393,9 @@ export function Historic({ cpf, onNavigate }: HistoricProps) {
       }
     });
 
-    doc.save(`historico-${cpf}.pdf`);
+    doc.save(`Historico-${personName || cpf}.pdf`);
   };
 
-  // ✅ ATUALIZAÇÃO: Botão ativo verde sólido igual PDF
   const RangeButton = ({ k, label }: { k: RangeKey; label: string }) => (
     <button
       type="button"
@@ -366,20 +418,21 @@ export function Historic({ cpf, onNavigate }: HistoricProps) {
     );
   }
 
+  const rangeLabel =
+    range === "today" ? "Hoje" : range === "7d" ? "7 dias" : "30 dias";
+
   return (
     <div className="space-y-4">
-      {/* Header (compacto igual Geração) */}
+      {/* Header */}
       <div className="flex items-start justify-between mb-6 gap-3">
         <div className="flex flex-col">
           <h2 className="text-2xl font-bold text-white">Histórico</h2>
 
-          {/* CPF (mesmo estilo da Geração) */}
           <div className="flex items-center gap-2 text-green-400 text-xs mt-1">
             <User className="w-3 h-3" />
             <span>CPF: {cpf || "Aguardando seleção..."}</span>
           </div>
 
-          {/* Nome (mesmo estilo da Geração) */}
           <div className="text-xs text-gray-300 mt-1">
             {cpf
               ? loadingName
@@ -392,7 +445,6 @@ export function Historic({ cpf, onNavigate }: HistoricProps) {
               : "—"}
           </div>
 
-          {/* Filtros + infos (mais compacto) */}
           <div className="flex flex-wrap items-center gap-3 mt-2">
             <div className="flex gap-2">
               <RangeButton k="today" label="Hoje" />
@@ -400,16 +452,8 @@ export function Historic({ cpf, onNavigate }: HistoricProps) {
               <RangeButton k="30d" label="30 dias" />
             </div>
 
-            {cpf && (
-              <div className="text-[11px] text-gray-400">
-                Tarifa:{" "}
-                <span className="text-gray-200 font-semibold">
-                  R$ {tarifaKwh.toFixed(2)}/kWh
-                </span>
-                {tarifaError && (
-                  <span className="text-yellow-400 ml-2">{tarifaError}</span>
-                )}
-              </div>
+            {tarifaError && (
+              <div className="text-[11px] text-yellow-400">{tarifaError}</div>
             )}
 
             {cpf && (
@@ -449,15 +493,15 @@ export function Historic({ cpf, onNavigate }: HistoricProps) {
         </div>
       ) : (
         <>
-          {/* ✅ CARDS COM BOTÃO (igual seu print) */}
+          {/* Cards topo */}
           <div className="grid grid-cols-2 gap-3 mb-6">
-            {/* GERAÇÃO */}
+            {/* Geração */}
             <div className="bg-[#1a2942] rounded-xl p-4 border border-gray-800">
               <div className="flex items-center justify-between gap-3">
                 <div className="flex items-center gap-2">
                   <TrendingUp className="w-5 h-5 text-green-400" />
                   <span className="text-gray-400 text-[10px] uppercase font-bold tracking-wider">
-                    GERAÇÃO SOLAR
+                    GERAÇÃO SOLAR ({rangeLabel})
                   </span>
                 </div>
 
@@ -474,13 +518,13 @@ export function Historic({ cpf, onNavigate }: HistoricProps) {
               </div>
 
               <p className="text-2xl font-bold text-white mt-2">
-                {toNum(history[0]?.solar_generation).toFixed(2)}{" "}
-                <span className="text-xs font-normal text-gray-400">kW</span>
+                {periodTotals.genKwh.toFixed(2)}{" "}
+                <span className="text-xs font-normal text-gray-400">kWh</span>
               </p>
 
               <div className="flex items-center justify-between mt-1">
                 <p className="text-[11px] text-gray-500">
-                  Visualizar detalhes em “Geração”
+                  Total no período selecionado
                 </p>
                 <button
                   type="button"
@@ -494,13 +538,13 @@ export function Historic({ cpf, onNavigate }: HistoricProps) {
               </div>
             </div>
 
-            {/* CONSUMO */}
+            {/* Consumo */}
             <div className="bg-[#1a2942] rounded-xl p-4 border border-gray-800">
               <div className="flex items-center justify-between gap-3">
                 <div className="flex items-center gap-2">
                   <TrendingDown className="w-5 h-5 text-blue-400" />
                   <span className="text-gray-400 text-[10px] uppercase font-bold tracking-wider">
-                    CARGA CASA
+                    CONSUMO ({rangeLabel})
                   </span>
                 </div>
 
@@ -517,13 +561,13 @@ export function Historic({ cpf, onNavigate }: HistoricProps) {
               </div>
 
               <p className="text-2xl font-bold text-white mt-2">
-                {toNum(history[0]?.house_consumption).toFixed(2)}{" "}
-                <span className="text-xs font-normal text-gray-400">kW</span>
+                {periodTotals.consKwh.toFixed(2)}{" "}
+                <span className="text-xs font-normal text-gray-400">kWh</span>
               </p>
 
               <div className="flex items-center justify-between mt-1">
                 <p className="text-[11px] text-gray-500">
-                  Visualizar detalhes em “Consumo”
+                  Total no período selecionado
                 </p>
                 <button
                   type="button"
@@ -538,7 +582,7 @@ export function Historic({ cpf, onNavigate }: HistoricProps) {
             </div>
           </div>
 
-          {/* ✅ agrupado por data + resumo diário + R$ */}
+          {/* Agrupado por dia */}
           <div className="space-y-6">
             {grouped.map((g) => (
               <div key={g.dateKey} className="space-y-3">
@@ -550,40 +594,40 @@ export function Historic({ cpf, onNavigate }: HistoricProps) {
                     </h3>
                   </div>
 
-                  <div className="text-right text-[12px]">
-                    <div className="text-gray-300">
-                      <span className="text-green-400 font-semibold">
-                        Gerado: {g.summary.genKwh.toFixed(2)} kWh
-                      </span>
-                      <span className="mx-2 text-gray-700">|</span>
-                      <span className="text-blue-400 font-semibold">
-                        Consumido: {g.summary.consKwh.toFixed(2)} kWh
-                      </span>
-                      <span className="mx-2 text-gray-700">|</span>
-                      <span className="text-gray-200 font-semibold">
-                        Saldo: {g.summary.saldoKwh.toFixed(2)} kWh
-                      </span>
-                    </div>
-
-                    <div className="text-gray-200 font-semibold mt-1">
-                      Economia do dia:{" "}
-                      <span className="text-green-300">
-                        R$ {g.summary.econBrl.toFixed(2)}
-                      </span>
-                    </div>
+                  <div className="text-[11px] text-gray-400">
+                    Gerado{" "}
+                    <span className="text-gray-200 font-semibold">
+                      {g.summary.genKwh.toFixed(2)} kWh
+                    </span>{" "}
+                    | Consumido{" "}
+                    <span className="text-gray-200 font-semibold">
+                      {g.summary.consKwh.toFixed(2)} kWh
+                    </span>{" "}
+                    | Saldo{" "}
+                    <span className="text-gray-200 font-semibold">
+                      {g.summary.saldoKwh.toFixed(2)} kWh
+                    </span>{" "}
+                    | Economizado{" "}
+                    <span className="text-green-300 font-semibold">
+                      R$ {g.summary.econBrl.toFixed(2)}
+                    </span>
                   </div>
                 </div>
 
+                {/* Lista por horário (W) */}
                 <div className="bg-[#1a2942] rounded-xl border border-gray-800 overflow-hidden">
                   {g.items.map((item: any, idx: number) => {
-                    const gen = Math.max(0, toNum(item.solar_generation));
-                    const cons = Math.max(0, toNum(item.house_consumption));
-                    const saldo = gen - cons;
+                    const genW = Math.max(0, toNum(item.solar_generation));
+                    const consW = Math.max(0, toNum(item.house_consumption));
+                    const saldoW = genW - consW;
 
                     const hora = new Date(item.timestamp).toLocaleTimeString(
                       "pt-BR",
                       { hour: "2-digit", minute: "2-digit", second: "2-digit" },
                     );
+
+                    // ✅ Wh do intervalo (10s)
+                    const genWh = genW * WH_FACTOR;
 
                     return (
                       <div
@@ -603,20 +647,25 @@ export function Historic({ cpf, onNavigate }: HistoricProps) {
                               <span className="text-gray-300">
                                 {toNum(item.voltage)}V
                               </span>
+                              <span className="text-gray-600"> • </span>
+                              Energia:{" "}
+                              <span className="text-gray-300">
+                                {genWh.toFixed(2)} Wh
+                              </span>
                             </div>
                           </div>
                         </div>
 
                         <div className="text-right shrink-0">
                           <div className="text-gray-200 font-bold text-[12px]">
-                            Saldo: {saldo.toFixed(2)} kW
+                            Saldo: {saldoW.toFixed(0)} W
                           </div>
                           <div className="flex items-center justify-end gap-3 mt-0.5 text-[11px]">
                             <span className="text-green-400 font-semibold">
-                              In: {gen.toFixed(2)} kW
+                              In: {genW.toFixed(0)} W
                             </span>
                             <span className="text-blue-400 font-semibold">
-                              Out: {cons.toFixed(2)} kW
+                              Out: {consW.toFixed(0)} W
                             </span>
                           </div>
                         </div>

@@ -61,7 +61,9 @@ function fmtTooltip(ts: string) {
 }
 
 // integra potência (W) => kWh pelo método do trapézio
-function integrateKwh(rowsAsc: { timestamp: string; house_consumption: any }[]) {
+function integrateKwh(
+  rowsAsc: { timestamp: string; house_consumption: any }[],
+) {
   if (!rowsAsc || rowsAsc.length < 2) return 0;
 
   let kwh = 0;
@@ -188,7 +190,10 @@ export function Consumption({ cpf }: ConsumptionProps) {
       return;
     }
 
-    const rows = (data || []) as { timestamp: string; house_consumption: any }[];
+    const rows = (data || []) as {
+      timestamp: string;
+      house_consumption: any;
+    }[];
     const kwh = integrateKwh(rows);
     setTodayKwh(Number(kwh.toFixed(3)));
   };

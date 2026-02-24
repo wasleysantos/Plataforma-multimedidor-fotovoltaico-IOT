@@ -6,7 +6,7 @@ interface CustomerRegisterPageProps {
   onBack?: () => void;
 }
 
-// ✅ helpers CPF
+// ✅ helpers
 function onlyDigits(v: string) {
   return (v || "").replace(/\D/g, "");
 }
@@ -26,13 +26,50 @@ function formatCpf(v: string) {
 }
 
 function formatCep(v: string) {
-  const digits = v.replace(/\D/g, "").slice(0, 8);
+  const digits = (v || "").replace(/\D/g, "").slice(0, 8);
   const part1 = digits.slice(0, 5);
   const part2 = digits.slice(5, 8);
   return part2 ? `${part1}-${part2}` : part1;
 }
 
-// ✅ validação CPF (dígitos verificadores)
+// ✅ máscara WhatsApp BR para exibição (DDD + número)
+function formatWhatsappBR(v: string) {
+  // aceita digitar com ou sem +55 (a gente ignora o 55 na máscara)
+  let d = onlyDigits(v);
+  if (d.startsWith("55")) d = d.slice(2);
+
+  d = d.slice(0, 11); // DDD + 8/9 dígitos
+  const ddd = d.slice(0, 2);
+  const rest = d.slice(2);
+
+  if (!ddd) return "";
+
+  // 11 dígitos => celular (9 dígitos); 10 dígitos => fixo (8 dígitos)
+  const isCell = d.length >= 11;
+
+  const p1 = isCell ? rest.slice(0, 5) : rest.slice(0, 4);
+  const p2 = isCell ? rest.slice(5, 9) : rest.slice(4, 8);
+
+  if (!rest) return `(${ddd}`;
+  if (!p1) return `(${ddd})`;
+  if (!p2) return `(${ddd}) ${p1}`;
+  return `(${ddd}) ${p1}-${p2}`;
+}
+
+// ✅ converte para E.164 BR: +55 + DDD + número (10/11 dígitos após DDD)
+function whatsappToE164BR(input: string) {
+  let d = onlyDigits(input);
+
+  // se vier com 55, remove para validar como "local"
+  if (d.startsWith("55")) d = d.slice(2);
+
+  // Agora esperamos 10 ou 11 dígitos (DDD + número)
+  if (!(d.length === 10 || d.length === 11)) return null;
+
+  return `+55${d}`;
+}
+
+// ✅ CPF válido
 function isValidCPF(cpf: string) {
   const clean = onlyDigits(cpf);
   if (clean.length !== 11) return false;
@@ -57,6 +94,11 @@ export function CustomerRegisterPage({ onBack }: CustomerRegisterPageProps) {
   const [newName, setNewName] = useState("");
   const [newCpf, setNewCpf] = useState("");
   const [newEmail, setNewEmail] = useState("");
+
+  // ✅ NOVOS CAMPOS
+  const [newWhatsapp, setNewWhatsapp] = useState("");
+  const [newDeviceId, setNewDeviceId] = useState("");
+
   const [newAddress, setNewAddress] = useState("");
   const [newZip, setNewZip] = useState("");
   const [newState, setNewState] = useState("");
@@ -85,9 +127,7 @@ export function CustomerRegisterPage({ onBack }: CustomerRegisterPageProps) {
         setNewState((data.uf || "").toUpperCase());
 
         const sugerido = [logradouro, bairro].filter(Boolean).join(" - ");
-        if (!newAddress.trim() && sugerido) {
-          setNewAddress(sugerido);
-        }
+        if (!newAddress.trim() && sugerido) setNewAddress(sugerido);
       }
     } catch (err) {
       console.error("Erro ao buscar CEP:", err);
@@ -107,10 +147,34 @@ export function CustomerRegisterPage({ onBack }: CustomerRegisterPageProps) {
       return;
     }
 
+    // ✅ whatsapp: salva como +55XXXXXXXXXXX
+    const whatsappE164 = newWhatsapp.trim()
+      ? whatsappToE164BR(newWhatsapp)
+      : null;
+
+    if (newWhatsapp.trim() && !whatsappE164) {
+      setStatus({
+        type: "error",
+        msg: "WhatsApp inválido. Use DDD + número (ex: (98) 98888-7777).",
+      });
+      setLoading(false);
+      return;
+    }
+
+    // ✅ device_id: uppercase + sem espaços
+    const deviceIdClean = (newDeviceId || "")
+      .trim()
+      .toUpperCase()
+      .replace(/\s+/g, "");
+
     const payload: any = {
       name: newName.trim(),
       cpf: cpfDigits,
       email: newEmail.trim() || null,
+
+      whatsapp: whatsappE164, // ✅ SALVO COM +55
+      device_id: deviceIdClean || null,
+
       address: newAddress.trim() || null,
       zip_code: newZip.trim() || null,
       state: newState.trim().toUpperCase() || null,
@@ -124,16 +188,19 @@ export function CustomerRegisterPage({ onBack }: CustomerRegisterPageProps) {
     if (error) {
       setStatus({
         type: "error",
-        msg: "Erro ao salvar. Verifique se o CPF é único e se as colunas existem no Supabase.",
+        msg: `Erro ao salvar: ${error.message || "verifique colunas/constraint no Supabase"}`,
       });
     } else {
       setStatus({
         type: "success",
         msg: "Cliente cadastrado/atualizado com sucesso!",
       });
+
       setNewName("");
       setNewCpf("");
       setNewEmail("");
+      setNewWhatsapp("");
+      setNewDeviceId("");
       setNewAddress("");
       setNewZip("");
       setNewCity("");
@@ -142,6 +209,10 @@ export function CustomerRegisterPage({ onBack }: CustomerRegisterPageProps) {
 
     setLoading(false);
   };
+
+  const whatsappPreview = newWhatsapp.trim()
+    ? whatsappToE164BR(newWhatsapp) || ""
+    : "";
 
   return (
     <div className="space-y-6 pb-24 max-w-3xl mx-auto">
@@ -156,7 +227,6 @@ export function CustomerRegisterPage({ onBack }: CustomerRegisterPageProps) {
           </p>
         </div>
 
-        {/* ✅ BOTÃO VOLTAR (para Settings) */}
         <button
           type="button"
           onClick={() => onBack?.()}
@@ -216,6 +286,35 @@ export function CustomerRegisterPage({ onBack }: CustomerRegisterPageProps) {
             </div>
           </div>
 
+          {/* WhatsApp + Device ID */}
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+            <div className="space-y-1">
+              <label className="text-xs text-gray-400">WhatsApp</label>
+              <input
+                className="w-full bg-[#0a1628] border border-gray-700 rounded-xl px-3 py-3 text-white text-sm outline-none focus:border-green-500"
+                placeholder="(98) 98888-7777"
+                value={newWhatsapp}
+                onChange={(e) =>
+                  setNewWhatsapp(formatWhatsappBR(e.target.value))
+                }
+                inputMode="tel"
+                maxLength={16}
+              />
+            </div>
+
+            <div className="space-y-1">
+              <label className="text-xs text-gray-400">
+                Número de série do equipamento (S/N)
+              </label>
+              <input
+                className="w-full bg-[#0a1628] border border-gray-700 rounded-xl px-3 py-3 text-white text-sm outline-none focus:border-green-500 uppercase tracking-wide"
+                placeholder="Ex: 24BRINV00018473"
+                value={newDeviceId}
+                onChange={(e) => setNewDeviceId(e.target.value)}
+              />
+            </div>
+          </div>
+
           {/* Endereço */}
           <div className="space-y-1">
             <label className="text-xs text-gray-400">Endereço</label>
@@ -241,9 +340,7 @@ export function CustomerRegisterPage({ onBack }: CustomerRegisterPageProps) {
                   setNewZip(formatted);
 
                   const digits = formatted.replace(/\D/g, "");
-                  if (digits.length === 8) {
-                    fetchAddressByCep(digits);
-                  }
+                  if (digits.length === 8) fetchAddressByCep(digits);
                 }}
               />
             </div>
@@ -265,7 +362,7 @@ export function CustomerRegisterPage({ onBack }: CustomerRegisterPageProps) {
             <label className="text-xs text-gray-400">Cidade</label>
             <input
               className="w-full bg-[#0a1628] border border-gray-700 rounded-xl px-3 py-3 text-white text-sm outline-none focus:border-green-500"
-              placeholder="Ex: São Luis"
+              placeholder="Ex: São Luís"
               value={newCity}
               onChange={(e) => setNewCity(e.target.value)}
             />
