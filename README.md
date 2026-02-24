@@ -2,6 +2,9 @@
 
 Projeto de **monitoramento de geração e consumo de energia solar**, integrando **hardware (IoT)** e **plataforma web**, com foco em visualização clara de dados, comunicação eficiente e arquitetura escalável.
 
+<img width="1024" height="1536" alt="Arquitetura Tesla Solar" src="https://github.com/user-attachments/assets/53cf40e0-213a-49ba-a661-dfae61d95dcb" />
+
+
 Desenvolvido como projeto acadêmico no **IFMA**, em parceria com a **Tesla Energia Solar**.
 
 ---
