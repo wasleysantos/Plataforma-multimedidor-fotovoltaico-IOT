@@ -12,9 +12,8 @@ import { supabase } from "../lib/supabase";
 
 type Row = {
   id: number;
-  timestamp: string;
-  solar_generation: any; // kW (potência)
-  house_consumption: any;
+  created_at: string;
+  active_power: any; // kW (potência) (mantive comentário do seu código)
 };
 
 type RangeKey = "24h" | "7d" | "30d";
@@ -28,7 +27,7 @@ function toNum(v: any) {
 function hoursForRange(r: RangeKey) {
   if (r === "24h") return 24;
   if (r === "7d") return 24 * 7;
-  return 24 * 30; // ✅ 30 dias
+  return 24 * 30;
 }
 
 function tsToMs(ts: string) {
@@ -48,12 +47,10 @@ function inWindow(ts: string, range: RangeKey) {
   return ms >= cutoff;
 }
 
-// ===== Formatações =====
 function fmtAxis(ts: string, range: RangeKey) {
   const d = new Date(ts);
   if (Number.isNaN(d.getTime())) return "--";
 
-  // 24h: HH:MM | 7d/30d: DD/MM
   if (range === "24h") {
     return new Intl.DateTimeFormat("pt-BR", {
       hour: "2-digit",
@@ -80,18 +77,12 @@ function fmtTooltip(ts: string) {
   }).format(d);
 }
 
-// ✅ kW -> kWh (trapézio) -> R$ economizado acumulado
 function buildSeries(points: { ts: string; genKw: number }[], tarifa: number) {
   let kwhAcum = 0;
 
   return points.map((p, i) => {
     if (i === 0) {
-      return {
-        ts: p.ts,
-        label: "", // preenchido depois (depende do range)
-        gen_kw: p.genKw,
-        brl_econ: 0,
-      };
+      return { ts: p.ts, label: "", gen_kw: p.genKw, brl_econ: 0 };
     }
 
     const t0 = tsToMs(points[i - 1].ts);
@@ -106,14 +97,13 @@ function buildSeries(points: { ts: string; genKw: number }[], tarifa: number) {
 
     return {
       ts: p.ts,
-      label: "", // preenchido depois (depende do range)
+      label: "",
       gen_kw: p.genKw,
       brl_econ: Number((kwhAcum * tarifa).toFixed(2)),
     };
   });
 }
 
-// ✅ fallback MA (se o cliente não tiver tarifa preenchida)
 const FALLBACK_TARIFA_MA = 0.85;
 
 export function PowerChart({ cpf }: { cpf: string }) {
@@ -124,7 +114,6 @@ export function PowerChart({ cpf }: { cpf: string }) {
   const [range, setRange] = useState<RangeKey>("24h");
   const [mode, setMode] = useState<Mode>("KW");
 
-  // ✅ tarifa vinda do Supabase (customers.tarifa_kwh)
   const [tarifaKwh, setTarifaKwh] = useState<number>(FALLBACK_TARIFA_MA);
   const [tarifaLoading, setTarifaLoading] = useState(false);
   const [tarifaError, setTarifaError] = useState("");
@@ -134,7 +123,6 @@ export function PowerChart({ cpf }: { cpf: string }) {
     rangeRef.current = range;
   }, [range]);
 
-  // ✅ Busca tarifa do cliente pelo CPF
   useEffect(() => {
     const fetchTarifa = async () => {
       if (!cpf) {
@@ -148,7 +136,7 @@ export function PowerChart({ cpf }: { cpf: string }) {
       setTarifaError("");
 
       const { data, error } = await supabase
-        .from("customers")
+        .from("clientes")
         .select("tarifa_kwh")
         .eq("cpf", cpf)
         .maybeSingle();
@@ -170,7 +158,6 @@ export function PowerChart({ cpf }: { cpf: string }) {
     fetchTarifa();
   }, [cpf]);
 
-  // ✅ busca dados do período (timestamp >= since)
   useEffect(() => {
     const fetchChart = async () => {
       if (!cpf) {
@@ -186,15 +173,15 @@ export function PowerChart({ cpf }: { cpf: string }) {
       const since = sinceIso(range);
 
       const { data, error } = await supabase
-        .from("measurements")
-        .select("id,timestamp,solar_generation,house_consumption")
+        .from("geracao")
+        .select("id,created_at,active_power") // ✅ removido house_consumption
         .eq("user_cpf", cpf)
-        .gte("timestamp", since)
-        .order("timestamp", { ascending: true });
+        .gte("created_at", since)
+        .order("created_at", { ascending: true });
 
       if (error) {
-        console.error("PowerChart measurements error:", error);
-        setDbError(error.message || "Erro ao consultar measurements");
+        console.error("PowerChart geracao error:", error);
+        setDbError(error.message || "Erro ao consultar geracao");
         setRows([]);
         setLoading(false);
         return;
@@ -207,7 +194,6 @@ export function PowerChart({ cpf }: { cpf: string }) {
     fetchChart();
   }, [cpf, range]);
 
-  // ✅ realtime
   useEffect(() => {
     if (!cpf) return;
 
@@ -218,7 +204,7 @@ export function PowerChart({ cpf }: { cpf: string }) {
         {
           event: "*",
           schema: "public",
-          table: "measurements",
+          table: "geracao",
           filter: `user_cpf=eq.${cpf}`,
         },
         (payload: any) => {
@@ -227,7 +213,7 @@ export function PowerChart({ cpf }: { cpf: string }) {
 
           const currentRange = rangeRef.current;
 
-          if (!inWindow(r.timestamp, currentRange)) {
+          if (!inWindow(r.created_at, currentRange)) {
             setRows((prev) => prev.filter((x) => x.id !== r.id));
             return;
           }
@@ -238,13 +224,13 @@ export function PowerChart({ cpf }: { cpf: string }) {
             map.set(r.id, r);
 
             const ordered = Array.from(map.values())
-              .filter((x) => Number.isFinite(tsToMs(x.timestamp)))
-              .sort((a, b) => tsToMs(a.timestamp) - tsToMs(b.timestamp));
+              .filter((x) => Number.isFinite(tsToMs(x.created_at)))
+              .sort((a, b) => tsToMs(a.created_at) - tsToMs(b.created_at));
 
             const cutoff =
               Date.now() - hoursForRange(currentRange) * 60 * 60 * 1000;
 
-            return ordered.filter((x) => tsToMs(x.timestamp) >= cutoff);
+            return ordered.filter((x) => tsToMs(x.created_at) >= cutoff);
           });
 
           setDbError("");
@@ -261,17 +247,16 @@ export function PowerChart({ cpf }: { cpf: string }) {
     if (!rows || rows.length === 0) return [];
 
     const ordered = [...rows]
-      .filter((r) => Number.isFinite(tsToMs(r.timestamp)))
-      .sort((a, b) => tsToMs(a.timestamp) - tsToMs(b.timestamp));
+      .filter((r) => Number.isFinite(tsToMs(r.created_at)))
+      .sort((a, b) => tsToMs(a.created_at) - tsToMs(b.created_at));
 
     const points = ordered.map((r) => ({
-      ts: r.timestamp,
-      genKw: Math.max(0, toNum(r.solar_generation)),
+      ts: r.created_at,
+      genKw: Math.max(0, toNum(r.active_power)),
     }));
 
     const series = buildSeries(points, tarifaKwh || 0);
 
-    // ✅ aplica label dependente do range
     return series.map((s) => ({
       ...s,
       label: fmtAxis(s.ts, range),
@@ -349,7 +334,6 @@ export function PowerChart({ cpf }: { cpf: string }) {
 
   return (
     <div className="w-full">
-      {/* topo: período + tarifa */}
       <div className="flex items-center justify-between mb-2 gap-3">
         <div className="text-[11px] text-gray-400">
           <span className="ml-3">
@@ -369,7 +353,6 @@ export function PowerChart({ cpf }: { cpf: string }) {
         </div>
       </div>
 
-      {/* modo + aviso */}
       <div className="flex items-center justify-between mb-2 gap-3">
         <div className="flex gap-2">
           <ModeButton m="KW" label="kW" />

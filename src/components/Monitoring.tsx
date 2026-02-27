@@ -3,11 +3,9 @@ import { Search, MapPin, ExternalLink, Wifi, WifiOff } from "lucide-react";
 import { supabase } from "../lib/supabase";
 
 interface MonitoringProps {
-  // ✅ permite selecionar um CPF pela base
   onSelectCpf?: (cpf: string) => void;
 }
 
-// ✅ helpers CPF
 function onlyDigits(v: string) {
   return (v || "").replace(/\D/g, "");
 }
@@ -27,23 +25,23 @@ function formatCpf(v: string) {
 }
 
 type CustomerRow = {
-  id: number;
+  id: string; // ✅ uuid
   name: string | null;
   cpf: string | null;
   email: string | null;
   state: string | null;
   city: string | null;
-  device_id: string | null;
+  device_geracao: string | null;
+  device_consumo?: string | null; // ✅ opcional (se você quiser usar)
 };
 
 type DeviceStatusRow = {
-  device_id: string;
+  device_geracao: string;
   relay_state: boolean | null;
   updated_at: string | null;
 };
 
 type CustomerWithStatus = CustomerRow & {
-  // ✅ regra: se estiver DESLIGADO (false) OU não existir na tabela => OFFLINE
   isOnline: boolean;
   statusUpdatedAt?: string | null;
 };
@@ -62,12 +60,12 @@ export function Monitoring({ onSelectCpf }: MonitoringProps) {
     try {
       // 1) clientes
       const { data: cData, error: cErr } = await supabase
-        .from("customers")
-        .select("id,name,cpf,email,state,city,device_id")
+        .from("clientes")
+        .select("id,name,cpf,email,state,city,device_geracao,device_consumo")
         .order("name", { ascending: true });
 
       if (cErr) {
-        setDbError(cErr.message || "Erro ao buscar customers");
+        setDbError(cErr.message || "Erro ao buscar clientes");
         setCustomers([]);
         setLoading(false);
         return;
@@ -78,10 +76,9 @@ export function Monitoring({ onSelectCpf }: MonitoringProps) {
       // 2) status dos dispositivos
       const { data: dData, error: dErr } = await supabase
         .from("device_status")
-        .select("device_id,relay_state,updated_at");
+        .select("device_geracao,relay_state,updated_at");
 
       if (dErr) {
-        // Se der erro na tabela, ainda assim mostramos a base, mas tudo OFFLINE
         const fallback = customersRaw.map((c) => ({
           ...c,
           isOnline: false,
@@ -95,19 +92,18 @@ export function Monitoring({ onSelectCpf }: MonitoringProps) {
 
       const statusRows = (dData || []) as DeviceStatusRow[];
       const statusByDevice = new Map<string, DeviceStatusRow>();
-      for (const s of statusRows) statusByDevice.set(String(s.device_id), s);
+      for (const s of statusRows)
+        statusByDevice.set(String(s.device_geracao).trim(), s);
 
-      // 3) merge + regra OFFLINE quando:
-      //    - não existe device_id no cliente
-      //    - não existe linha em device_status
-      //    - relay_state === false (DESLIGADO)
-      //    - relay_state === null (tratamos como OFFLINE)
+      // 3) merge: usa device_geracao (fallback: device_consumo)
       const merged: CustomerWithStatus[] = customersRaw.map((c) => {
-        const devId = (c.device_id || "").trim();
+        const devId =
+          (c.device_geracao || "").trim() || (c.device_consumo || "").trim();
+
         const st = devId ? statusByDevice.get(devId) : undefined;
 
         const relay = st?.relay_state;
-        const isOnline = relay === true; // ✅ só TRUE vira ONLINE, o resto é OFFLINE
+        const isOnline = relay === true;
 
         return {
           ...c,
@@ -127,8 +123,6 @@ export function Monitoring({ onSelectCpf }: MonitoringProps) {
 
   useEffect(() => {
     fetchBase();
-
-    // ✅ opcional: atualizar status periodicamente
     const id = window.setInterval(() => fetchBase(), 15000);
     return () => window.clearInterval(id);
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -139,18 +133,13 @@ export function Monitoring({ onSelectCpf }: MonitoringProps) {
 
     return (customers || []).filter((c) => {
       const cpfMasked = formatCpf(c.cpf || "");
-      return [
-        c.name,
-        c.cpf,
-        cpfMasked,
-        c.city,
-        c.email,
-        c.state,
-        c.device_id,
-      ].some((f) =>
-        String(f || "")
-          .toLowerCase()
-          .includes(term),
+      const dev = (c.device_geracao || c.device_consumo || "").trim();
+
+      return [c.name, c.cpf, cpfMasked, c.city, c.email, c.state, dev].some(
+        (f) =>
+          String(f || "")
+            .toLowerCase()
+            .includes(term),
       );
     });
   }, [customers, searchTerm]);
@@ -212,10 +201,12 @@ export function Monitoring({ onSelectCpf }: MonitoringProps) {
 
           <div className="space-y-3 max-h-72 overflow-y-auto pr-2 custom-scrollbar">
             {filteredCustomers.map((c) => {
-              const statusText = c.isOnline ? "Online" : "Offline"; // ✅ sem “DESLIGADO”
+              const statusText = c.isOnline ? "Online" : "Offline";
               const statusClass = c.isOnline
                 ? "bg-green-500/15 text-green-400"
                 : "bg-red-500/15 text-red-400";
+
+              const dev = (c.device_geracao || c.device_consumo || "").trim();
 
               return (
                 <div
@@ -236,9 +227,7 @@ export function Monitoring({ onSelectCpf }: MonitoringProps) {
                         <span
                           className={`shrink-0 inline-flex items-center gap-1 px-2 py-1 rounded-lg text-[10px] font-bold ${statusClass}`}
                           title={
-                            c.device_id
-                              ? `device_id: ${c.device_id}`
-                              : "Sem device_id (OFFLINE)"
+                            dev ? `device: ${dev}` : "Sem device (OFFLINE)"
                           }
                         >
                           {c.isOnline ? (
@@ -262,7 +251,6 @@ export function Monitoring({ onSelectCpf }: MonitoringProps) {
                         {c.email ? ` • ${c.email}` : ""}
                       </p>
 
-                      {/* opcional: mostrar última atualização do status */}
                       {c.statusUpdatedAt && (
                         <p className="text-gray-600 text-[10px] mt-1">
                           Status atualizado em:{" "}

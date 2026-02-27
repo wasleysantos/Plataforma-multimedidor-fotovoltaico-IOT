@@ -1,12 +1,3 @@
-// Historic.tsx (COMPLETO ATUALIZADO) ✅
-// NOVA BASE (igual ao Generation atualizado):
-// - solar_generation = potência em W (amostra a cada 10s)
-// - Wh por amostra = W * (10/3600) = W/360
-// - kWh do período/dia = soma(Wh)/1000
-// - NÃO usa mais solar_generation_wh no cálculo (pode continuar exibindo se quiser, mas aqui removi do select e do PDF/lista)
-// - Consumo/saldo mantidos por integração (W->kWh) usando timestamps (para não quebrar)
-// - Lista por horário segue exibindo POTÊNCIA em W
-
 import { useEffect, useMemo, useState } from "react";
 import { supabase } from "../lib/supabase";
 import {
@@ -20,21 +11,17 @@ import {
 } from "lucide-react";
 import jsPDF from "jspdf";
 
+// ✅ cálculo unificado (igual Dashboard/Generation/Consumption)
+import { integrateKwhFromRows, toNum } from "./EnergyCalc";
+
 interface HistoricProps {
   cpf: string;
   onNavigate?: (page: "generation" | "consumption") => void;
 }
 
-type RangeKey = "today" | "7d" | "30d";
-
-function toNum(v: any) {
-  const n = Number(v);
-  return Number.isFinite(n) ? n : 0;
-}
-
-function tsToMs(ts: string) {
-  const ms = new Date(ts).getTime();
-  return Number.isFinite(ms) ? ms : NaN;
+function tsToMsSafe(ts: string) {
+  const t = Date.parse(ts);
+  return Number.isFinite(t) ? t : NaN;
 }
 
 function fmtDateKey(ts: string) {
@@ -57,72 +44,105 @@ function fmtDateHeader(key: string) {
   }).format(date);
 }
 
-function startIsoForRange(range: RangeKey) {
-  const now = new Date();
-
-  if (range === "today") {
-    const start = new Date(
-      now.getFullYear(),
-      now.getMonth(),
-      now.getDate(),
-      0,
-      0,
-      0,
-    );
-    return start.toISOString();
-  }
-
-  const days = range === "7d" ? 7 : 30;
-  return new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString();
+function startIsoFromDateInput(dateStr: string) {
+  if (!dateStr) return "";
+  const [y, m, d] = dateStr.split("-").map(Number);
+  const dt = new Date(y, (m || 1) - 1, d || 1, 0, 0, 0, 0);
+  return dt.toISOString();
 }
 
-// ✅ base fixa: amostra a cada 10 segundos
-const SAMPLE_SECONDS = 10;
-const WH_FACTOR = SAMPLE_SECONDS / 3600; // 1/360
-
-// ✅ GERAÇÃO: soma potência (W) -> Wh do intervalo -> kWh
-function sumGenKwhFromW(items: any[]) {
-  const totalWh = (items || []).reduce((acc, it) => {
-    const w = Math.max(0, toNum(it?.solar_generation));
-    return acc + w * WH_FACTOR;
-  }, 0);
-
-  return totalWh / 1000;
+function endIsoFromDateInput(dateStr: string) {
+  if (!dateStr) return "";
+  const [y, m, d] = dateStr.split("-").map(Number);
+  const dt = new Date(y, (m || 1) - 1, d || 1, 23, 59, 59, 999);
+  return dt.toISOString();
 }
 
-// ✅ CONSUMO: integra W -> kWh (trapézio) pelos timestamps (mantém seu comportamento anterior)
-function integrateConsKwhFromW(itemsAsc: any[]) {
-  if (!itemsAsc || itemsAsc.length < 2) return 0;
-
-  let consKwh = 0;
-
-  for (let i = 1; i < itemsAsc.length; i++) {
-    const prev = itemsAsc[i - 1];
-    const curr = itemsAsc[i];
-
-    const t0 = tsToMs(prev.timestamp);
-    const t1 = tsToMs(curr.timestamp);
-    if (!Number.isFinite(t0) || !Number.isFinite(t1)) continue;
-
-    const dtHours = Math.max(0, (t1 - t0) / (1000 * 60 * 60));
-
-    // W -> kW
-    const c0kw = Math.max(0, toNum(prev.house_consumption)) / 1000;
-    const c1kw = Math.max(0, toNum(curr.house_consumption)) / 1000;
-
-    consKwh += ((c0kw + c1kw) / 2) * dtHours;
-  }
-
-  return consKwh;
+function fmtDatePtBr(dateStr: string) {
+  if (!dateStr) return "—";
+  const [y, m, d] = dateStr.split("-");
+  if (!y || !m || !d) return "—";
+  return `${d}/${m}/${y}`;
 }
 
 const FALLBACK_TARIFA = 0.85;
 
+const normalizeCpf = (value: string) =>
+  (value || "").replace(/\D/g, "").slice(0, 11);
+
+const maskCPF = (value: string) => {
+  const v = normalizeCpf(value);
+  const p1 = v.slice(0, 3);
+  const p2 = v.slice(3, 6);
+  const p3 = v.slice(6, 9);
+  const p4 = v.slice(9, 11);
+
+  let out = p1;
+  if (p2) out += `.${p2}`;
+  if (p3) out += `.${p3}`;
+  if (p4) out += `-${p4}`;
+  return out;
+};
+
+type ConsPoint = { t: number; w: number };
+
+function findClosestWithin(
+  pointsAsc: ConsPoint[],
+  targetMs: number,
+  toleranceMs: number,
+) {
+  if (!pointsAsc.length || !Number.isFinite(targetMs)) return 0;
+
+  let lo = 0;
+  let hi = pointsAsc.length;
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1;
+    if (pointsAsc[mid].t < targetMs) lo = mid + 1;
+    else hi = mid;
+  }
+
+  const cand: ConsPoint[] = [];
+  if (lo < pointsAsc.length) cand.push(pointsAsc[lo]);
+  if (lo - 1 >= 0) cand.push(pointsAsc[lo - 1]);
+
+  let best = 0;
+  let bestDt = Infinity;
+
+  for (const c of cand) {
+    const dt = Math.abs(c.t - targetMs);
+    if (dt <= toleranceMs && dt < bestDt) {
+      bestDt = dt;
+      best = c.w;
+    }
+  }
+
+  return best;
+}
+
+function formatLastUpdated(ts: string | null) {
+  if (!ts) return "—";
+  const d = new Date(ts);
+  if (Number.isNaN(d.getTime())) return "—";
+  return new Intl.DateTimeFormat("pt-BR", {
+    day: "2-digit",
+    month: "2-digit",
+    year: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+  }).format(d);
+}
+
 export function Historic({ cpf, onNavigate }: HistoricProps) {
-  const [history, setHistory] = useState<any[]>([]);
+  const todayStr = new Date().toISOString().slice(0, 10);
+
+  const [genHistoryAsc, setGenHistoryAsc] = useState<any[]>([]);
+  const [consHistoryAsc, setConsHistoryAsc] = useState<any[]>([]);
   const [loading, setLoading] = useState(true);
 
-  const [range, setRange] = useState<RangeKey>("7d");
+  // ✅ Calendário sempre visível (default: hoje → hoje)
+  const [startDate, setStartDate] = useState(todayStr); // YYYY-MM-DD
+  const [endDate, setEndDate] = useState(todayStr); // YYYY-MM-DD
 
   const [personName, setPersonName] = useState("");
   const [nameNotFound, setNameNotFound] = useState(false);
@@ -131,6 +151,56 @@ export function Historic({ cpf, onNavigate }: HistoricProps) {
   const [tarifaKwh, setTarifaKwh] = useState<number>(FALLBACK_TARIFA);
   const [tarifaError, setTarifaError] = useState("");
 
+  // ✅ Última atualização (separadas, fora do período)
+  const [lastUpdatedGen, setLastUpdatedGen] = useState("—");
+  const [lastUpdatedCons, setLastUpdatedCons] = useState("—");
+
+  // ✅ Paginação por DIA
+  const [currentPage, setCurrentPage] = useState(1);
+  const ITEMS_PER_PAGE = 5;
+
+  const cpfVariants = useMemo(() => {
+    if (!cpf) return [];
+    const clean = normalizeCpf(cpf);
+    const masked = maskCPF(clean);
+    return Array.from(new Set([clean, masked]));
+  }, [cpf]);
+
+  // reset pagina ao trocar cpf/datas
+  useEffect(() => {
+    setCurrentPage(1);
+  }, [cpf, startDate, endDate]);
+
+  // ✅ resolve período (since/until) pelo calendário
+  const period = useMemo(() => {
+    const valid =
+      !!startDate &&
+      !!endDate &&
+      Number.isFinite(Date.parse(startDate)) &&
+      Number.isFinite(Date.parse(endDate)) &&
+      Date.parse(startDate) <= Date.parse(endDate);
+
+    if (!valid) {
+      return {
+        since: "",
+        until: "",
+        label: "Período inválido",
+        invalid: true,
+      };
+    }
+
+    const since = startIsoFromDateInput(startDate);
+    const until = endIsoFromDateInput(endDate);
+
+    return {
+      since,
+      until,
+      label: `${fmtDatePtBr(startDate)} → ${fmtDatePtBr(endDate)}`,
+      invalid: false,
+    };
+  }, [startDate, endDate]);
+
+  // ✅ clientes
   useEffect(() => {
     const fetchCustomer = async () => {
       if (!cpf) {
@@ -147,13 +217,13 @@ export function Historic({ cpf, onNavigate }: HistoricProps) {
       setTarifaError("");
 
       const { data, error } = await supabase
-        .from("customers")
+        .from("clientes")
         .select("name,tarifa_kwh")
-        .eq("cpf", cpf)
+        .eq("cpf", normalizeCpf(cpf))
         .maybeSingle();
 
       if (error) {
-        console.error("Erro customers:", error);
+        console.error("Erro clientes:", error);
         setPersonName("");
         setNameNotFound(false);
         setTarifaKwh(FALLBACK_TARIFA);
@@ -182,127 +252,194 @@ export function Historic({ cpf, onNavigate }: HistoricProps) {
     fetchCustomer();
   }, [cpf]);
 
+  // ✅ Última atualização: separados (fora do período)
+  useEffect(() => {
+    const fetchLastUpdated = async () => {
+      if (!cpf) {
+        setLastUpdatedGen("—");
+        setLastUpdatedCons("—");
+        return;
+      }
+
+      const cpfClean = normalizeCpf(cpf);
+      const variants = cpfVariants;
+
+      const genReq = supabase
+        .from("geracao")
+        .select("created_at")
+        .eq("user_cpf", cpfClean)
+        .order("created_at", { ascending: false })
+        .limit(1);
+
+      const consReq = supabase
+        .from("consumo")
+        .select("created_at")
+        .in("user_cpf", variants)
+        .order("created_at", { ascending: false })
+        .limit(1);
+
+      const [genRes, consRes] = await Promise.all([genReq, consReq]);
+
+      const genTs = genRes.data?.[0]?.created_at ?? null;
+      const consTs = consRes.data?.[0]?.created_at ?? null;
+
+      setLastUpdatedGen(formatLastUpdated(genTs));
+      setLastUpdatedCons(formatLastUpdated(consTs));
+    };
+
+    fetchLastUpdated();
+    if (!cpf) return;
+
+    const id = window.setInterval(fetchLastUpdated, 5000);
+    return () => window.clearInterval(id);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [cpf, cpfVariants]);
+
+  // ✅ geracao + consumo (mesmo período) — BUSCA ASC (para cálculo e match)
   useEffect(() => {
     const fetchHistory = async () => {
-      if (!cpf) {
-        setHistory([]);
+      if (!cpf || period.invalid) {
+        setGenHistoryAsc([]);
+        setConsHistoryAsc([]);
         setLoading(false);
         return;
       }
 
       setLoading(true);
 
-      const since = startIsoForRange(range);
+      const cpfClean = normalizeCpf(cpf);
 
-      // ✅ agora só precisamos de solar_generation (W) + consumo/tensão
-      const { data, error } = await supabase
-        .from("measurements")
-        .select("id,timestamp,voltage,solar_generation,house_consumption")
-        .eq("user_cpf", cpf)
-        .gte("timestamp", since)
-        .order("timestamp", { ascending: false })
-        .limit(10000);
+      const genReq = supabase
+        .from("geracao")
+        .select("id,created_at,voltage,active_power")
+        .eq("user_cpf", cpfClean)
+        .gte("created_at", period.since)
+        .lte("created_at", period.until)
+        .order("created_at", { ascending: true })
+        .limit(1000000);
 
-      if (error) {
-        console.error("Historic measurements error:", error);
-        setHistory([]);
-        setLoading(false);
-        return;
+      const consReq = supabase
+        .from("consumo")
+        .select("id,created_at,active_power,user_cpf")
+        .in("user_cpf", cpfVariants)
+        .gte("created_at", period.since)
+        .lte("created_at", period.until)
+        .order("created_at", { ascending: true })
+        .limit(1000000);
+
+      const [genRes, consRes] = await Promise.all([genReq, consReq]);
+
+      if (genRes.error) {
+        console.error("Historic geracao error:", genRes.error);
+        setGenHistoryAsc([]);
+      } else {
+        setGenHistoryAsc(genRes.data || []);
       }
 
-      setHistory(data || []);
+      if (consRes.error) {
+        console.error("Historic consumo error:", consRes.error);
+        setConsHistoryAsc([]);
+      } else {
+        setConsHistoryAsc(consRes.data || []);
+      }
+
       setLoading(false);
     };
 
     fetchHistory();
-  }, [cpf, range]);
+  }, [cpf, cpfVariants, period.since, period.until, period.invalid]);
 
-  // ✅ total do período (cards topo)
-  const periodTotals = useMemo(() => {
-    if (!history || history.length === 0) {
-      return { genKwh: 0, consKwh: 0, saldoKwh: 0, lastVoltage: 0 };
+  // ✅ pontos do consumo para OUT (busca binária)
+  const consPointsAsc = useMemo<ConsPoint[]>(() => {
+    const pts: ConsPoint[] = [];
+    for (const it of consHistoryAsc || []) {
+      const t = tsToMsSafe(it.created_at);
+      if (!Number.isFinite(t)) continue;
+      pts.push({ t, w: Math.max(0, toNum(it.active_power)) });
     }
+    pts.sort((a, b) => a.t - b.t);
+    return pts;
+  }, [consHistoryAsc]);
 
-    // ✅ geração pelo W (10s) -> kWh
-    const genKwh = sumGenKwhFromW(history);
-
-    // ✅ consumo por integração (W->kWh)
-    const asc = [...history].sort(
-      (a, b) =>
-        new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime(),
+  // ✅ Totais do período (IGUAL Dashboard)
+  const periodTotals = useMemo(() => {
+    const genAsc = [...(genHistoryAsc || [])].sort(
+      (a, b) => tsToMsSafe(a.created_at) - tsToMsSafe(b.created_at),
     );
-    const consKwh = integrateConsKwhFromW(asc);
+    const consAsc = [...(consHistoryAsc || [])].sort(
+      (a, b) => tsToMsSafe(a.created_at) - tsToMsSafe(b.created_at),
+    );
 
+    const genKwh = integrateKwhFromRows(genAsc);
+    const consKwh = integrateKwhFromRows(consAsc);
     const saldoKwh = genKwh - consKwh;
 
-    return {
-      genKwh,
-      consKwh,
-      saldoKwh,
-      lastVoltage: toNum(history?.[0]?.voltage),
-    };
-  }, [history]);
+    return { genKwh, consKwh, saldoKwh };
+  }, [genHistoryAsc, consHistoryAsc]);
 
   const periodEconBrl = useMemo(() => {
     return periodTotals.genKwh * (tarifaKwh || 0);
   }, [periodTotals.genKwh, tarifaKwh]);
 
-  // ✅ Agrupa por data + resumo diário
+  // ✅ Agrupa por dia — tudo do mais novo → mais antigo
   const grouped = useMemo(() => {
-    const map = new Map<string, any[]>();
+    const mapGen = new Map<string, any[]>();
+    const mapCons = new Map<string, any[]>();
 
-    for (const item of history) {
-      const k = fmtDateKey(item.timestamp);
-      if (!map.has(k)) map.set(k, []);
-      map.get(k)!.push(item);
+    for (const item of genHistoryAsc || []) {
+      const k = fmtDateKey(item.created_at);
+      if (!mapGen.has(k)) mapGen.set(k, []);
+      mapGen.get(k)!.push(item);
     }
 
-    const keys = Array.from(map.keys()).sort((a, b) => (a > b ? -1 : 1));
+    for (const item of consHistoryAsc || []) {
+      const k = fmtDateKey(item.created_at);
+      if (!mapCons.has(k)) mapCons.set(k, []);
+      mapCons.get(k)!.push(item);
+    }
+
+    const keys = Array.from(
+      new Set([...Array.from(mapGen.keys()), ...Array.from(mapCons.keys())]),
+    ).sort((a, b) => {
+      const ta = Date.parse(a + "T00:00:00");
+      const tb = Date.parse(b + "T00:00:00");
+      return tb - ta; // ✅ dia mais novo primeiro
+    });
 
     return keys.map((k) => {
-      const dayItemsDesc = (map.get(k) || []).sort(
-        (a, b) =>
-          new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime(),
+      const dayGenAsc = (mapGen.get(k) || []).sort(
+        (a, b) => tsToMsSafe(a.created_at) - tsToMsSafe(b.created_at),
+      );
+      const dayConsAsc = (mapCons.get(k) || []).sort(
+        (a, b) => tsToMsSafe(a.created_at) - tsToMsSafe(b.created_at),
       );
 
-      // ✅ geração diária pelo W (10s) -> kWh
-      const genKwh = sumGenKwhFromW(dayItemsDesc);
-
-      // ✅ consumo diário por integração (W->kWh)
-      const dayItemsAsc = [...dayItemsDesc].reverse();
-      const consKwh = integrateConsKwhFromW(dayItemsAsc);
-
+      const genKwh = integrateKwhFromRows(dayGenAsc);
+      const consKwh = integrateKwhFromRows(dayConsAsc);
       const saldoKwh = genKwh - consKwh;
       const econBrl = genKwh * (tarifaKwh || 0);
+
+      // ✅ horários mais novos primeiro
+      const dayGenDesc = [...dayGenAsc].sort(
+        (a, b) => tsToMsSafe(b.created_at) - tsToMsSafe(a.created_at),
+      );
 
       return {
         dateKey: k,
         title: fmtDateHeader(k),
-        items: dayItemsDesc,
-        summary: {
-          genKwh,
-          consKwh,
-          saldoKwh,
-          econBrl,
-        },
+        items: dayGenDesc,
+        summary: { genKwh, consKwh, saldoKwh, econBrl },
       };
     });
-  }, [history, tarifaKwh]);
+  }, [genHistoryAsc, consHistoryAsc, tarifaKwh]);
 
-  const lastTs = history?.[0]?.timestamp
-    ? new Date(history[0].timestamp)
-    : null;
-
-  const lastUpdatedLabel = lastTs
-    ? new Intl.DateTimeFormat("pt-BR", {
-        day: "2-digit",
-        month: "2-digit",
-        year: "numeric",
-        hour: "2-digit",
-        minute: "2-digit",
-        second: "2-digit",
-      }).format(lastTs)
-    : "—";
+  // ✅ Paginação por DIA (depois do agrupamento)
+  const totalPages = Math.max(1, Math.ceil(grouped.length / ITEMS_PER_PAGE));
+  const paginatedGrouped = useMemo(() => {
+    const start = (currentPage - 1) * ITEMS_PER_PAGE;
+    const end = start + ITEMS_PER_PAGE;
+    return grouped.slice(start, end);
+  }, [grouped, currentPage]);
 
   const exportToPDF = () => {
     const doc = new jsPDF();
@@ -312,10 +449,7 @@ export function Historic({ cpf, onNavigate }: HistoricProps) {
     doc.text(`CPF: ${cpf}`, 14, 30);
     if (personName) doc.text(`Cliente: ${personName}`, 14, 36);
 
-    const rangeLabel =
-      range === "today" ? "Hoje" : range === "7d" ? "7 dias" : "30 dias";
-
-    doc.text(`Período: ${rangeLabel}`, 14, personName ? 42 : 36);
+    doc.text(`Período: ${period.label}`, 14, personName ? 42 : 36);
     doc.text(
       `Tarifa: R$ ${tarifaKwh.toFixed(2)}/kWh`,
       14,
@@ -358,23 +492,24 @@ export function Historic({ cpf, onNavigate }: HistoricProps) {
       doc.setFontSize(9);
 
       g.items.forEach((item: any) => {
-        const hora = new Date(item.timestamp).toLocaleTimeString("pt-BR", {
+        const hora = new Date(item.created_at).toLocaleTimeString("pt-BR", {
           hour: "2-digit",
           minute: "2-digit",
           second: "2-digit",
         });
 
-        const potW = Math.max(0, toNum(item.solar_generation));
+        const genW = Math.max(0, toNum(item.active_power));
         const tens = toNum(item.voltage);
-        const consW = Math.max(0, toNum(item.house_consumption));
 
-        // ✅ energia do intervalo calculada (Wh) pela base fixa de 10s
-        const enerWh = potW * WH_FACTOR;
+        const tGen = tsToMsSafe(item.created_at);
+        const consW = findClosestWithin(consPointsAsc, tGen, 15000);
+
+        const saldoW = genW - consW;
 
         doc.text(
-          `${hora} | Tens: ${tens}V | Pot: ${potW.toFixed(
+          `${hora} | Tens: ${tens}V | In: ${genW.toFixed(
             0,
-          )}W | Ener: ${enerWh.toFixed(2)}Wh | Cons: ${consW.toFixed(0)}W`,
+          )}W | Out: ${consW.toFixed(0)}W | Saldo: ${saldoW.toFixed(0)}W`,
           14,
           y,
         );
@@ -396,20 +531,6 @@ export function Historic({ cpf, onNavigate }: HistoricProps) {
     doc.save(`Historico-${personName || cpf}.pdf`);
   };
 
-  const RangeButton = ({ k, label }: { k: RangeKey; label: string }) => (
-    <button
-      type="button"
-      onClick={() => setRange(k)}
-      className={`px-4 py-2 rounded-lg text-[12px] font-semibold transition-all duration-200 ${
-        range === k
-          ? "bg-green-500 hover:bg-green-600 text-white shadow-lg shadow-green-500/20"
-          : "bg-transparent text-gray-300 border border-gray-700 hover:bg-white/5"
-      }`}
-    >
-      {label}
-    </button>
-  );
-
   if (loading) {
     return (
       <div className="p-8 text-center text-white animate-pulse">
@@ -418,8 +539,8 @@ export function Historic({ cpf, onNavigate }: HistoricProps) {
     );
   }
 
-  const rangeLabel =
-    range === "today" ? "Hoje" : range === "7d" ? "7 dias" : "30 dias";
+  const hasAnyData =
+    (genHistoryAsc?.length || 0) > 0 || (consHistoryAsc?.length || 0) > 0;
 
   return (
     <div className="space-y-4">
@@ -427,47 +548,77 @@ export function Historic({ cpf, onNavigate }: HistoricProps) {
       <div className="flex items-start justify-between mb-6 gap-3">
         <div className="flex flex-col">
           <h2 className="text-2xl font-bold text-white">Histórico</h2>
+          <div className="flex items-center gap-3 text-green-300 text-xs mt-1"></div>
 
-          <div className="flex items-center gap-2 text-green-400 text-xs mt-1">
-            <User className="w-3 h-3" />
-            <span>CPF: {cpf || "Aguardando seleção..."}</span>
+          <div className="text-xs mt-1">
+            {!cpf ? (
+              <span className="text-green-400">
+                Cliente: Aguardando seleção...
+              </span>
+            ) : loadingName ? (
+              <span className="text-gray-300">Carregando nome...</span>
+            ) : personName ? (
+              <span className="text-green-400 font-semibold">{personName}</span>
+            ) : nameNotFound ? (
+              <span className="text-red-400 font-semibold">
+                CPF não encontrado
+              </span>
+            ) : (
+              <span className="text-gray-400">—</span>
+            )}
           </div>
 
-          <div className="text-xs text-gray-300 mt-1">
-            {cpf
-              ? loadingName
-                ? "Carregando nome..."
-                : personName
-                  ? personName
-                  : nameNotFound
-                    ? "CPF não encontrado"
-                    : "—"
-              : "—"}
-          </div>
+          {/* ✅ Calendário SEMPRE visível */}
+          <div className="flex flex-wrap items-end gap-3 mt-3 bg-white/5 border border-gray-800 rounded-xl p-3">
+            <div className="flex flex-col">
+              <label className="text-[11px] text-gray-300 mb-1">
+                Selecionar período:
+              </label>
 
-          <div className="flex flex-wrap items-center gap-3 mt-2">
-            <div className="flex gap-2">
-              <RangeButton k="today" label="Hoje" />
-              <RangeButton k="7d" label="7 dias" />
-              <RangeButton k="30d" label="30 dias" />
+              <label className="text-[11px] text-gray-400 mb-1">Início</label>
+              <input
+                type="date"
+                value={startDate}
+                onChange={(e) => setStartDate(e.target.value)}
+                className="bg-[#1a2942] text-white text-sm px-3 py-2 rounded-lg border border-gray-700 outline-none"
+              />
+            </div>
+
+            <div className="flex flex-col">
+              <label className="text-[11px] text-gray-400 mb-1">
+                <br></br>
+              </label>
+              <label className="text-[11px] text-gray-400 mb-1">Fim</label>
+              <input
+                type="date"
+                value={endDate}
+                onChange={(e) => setEndDate(e.target.value)}
+                className="bg-[#1a2942] text-white text-sm px-3 py-2 rounded-lg border border-gray-700 outline-none"
+              />
             </div>
 
             {tarifaError && (
               <div className="text-[11px] text-yellow-400">{tarifaError}</div>
             )}
-
-            {cpf && (
-              <div className="text-[11px] text-gray-500">
-                Última atualização:{" "}
-                <span className="text-gray-300">{lastUpdatedLabel}</span>
-              </div>
-            )}
           </div>
+
+          {cpf && (
+            <div className="flex flex-col gap-0.5 text-[11px] text-gray-500 mt-2">
+              <div>
+                Última geração:{" "}
+                <span className="text-gray-300">{lastUpdatedGen}</span>
+              </div>
+              <div>
+                Último consumo:{" "}
+                <span className="text-gray-300">{lastUpdatedCons}</span>
+              </div>
+            </div>
+          )}
         </div>
 
         <button
           onClick={exportToPDF}
-          disabled={!cpf || history.length === 0}
+          disabled={!cpf || !hasAnyData || period.invalid}
           className="flex items-center gap-3 bg-green-500 hover:bg-green-600 disabled:bg-gray-700 text-white px-3 py-2 rounded-lg transition-colors text-xs font-semibold"
         >
           <Download className="w-4 h-4" />
@@ -479,17 +630,15 @@ export function Historic({ cpf, onNavigate }: HistoricProps) {
         <div className="bg-[#1a2942] rounded-2xl p-10 text-center border border-dashed border-gray-700">
           <p className="text-gray-500">Selecione um CPF no Painel Geral.</p>
         </div>
-      ) : history.length === 0 ? (
+      ) : period.invalid ? (
         <div className="bg-[#1a2942] rounded-2xl p-10 text-center border border-dashed border-gray-700">
           <p className="text-gray-500">
-            Sem dados para{" "}
-            {range === "today"
-              ? "Hoje"
-              : range === "7d"
-                ? "os últimos 7 dias"
-                : "os últimos 30 dias"}
-            .
+            Selecione um período válido no calendário (início ≤ fim).
           </p>
+        </div>
+      ) : !hasAnyData ? (
+        <div className="bg-[#1a2942] rounded-2xl p-10 text-center border border-dashed border-gray-700">
+          <p className="text-gray-500">Sem dados para o período selecionado.</p>
         </div>
       ) : (
         <>
@@ -501,7 +650,7 @@ export function Historic({ cpf, onNavigate }: HistoricProps) {
                 <div className="flex items-center gap-2">
                   <TrendingUp className="w-5 h-5 text-green-400" />
                   <span className="text-gray-400 text-[10px] uppercase font-bold tracking-wider">
-                    GERAÇÃO SOLAR ({rangeLabel})
+                    GERAÇÃO SOLAR ({period.label})
                   </span>
                 </div>
 
@@ -509,8 +658,7 @@ export function Historic({ cpf, onNavigate }: HistoricProps) {
                   type="button"
                   onClick={() => onNavigate?.("generation")}
                   disabled={!cpf}
-                  className="p-2 rounded-lg border border-gray-700 hover:bg-white/5 transition-colors
-                             disabled:opacity-50 disabled:hover:bg-transparent"
+                  className="p-2 rounded-lg border border-gray-700 hover:bg-white/5 transition-colors disabled:opacity-50 disabled:hover:bg-transparent"
                   title="Abrir página de Geração"
                 >
                   <ChevronRight className="w-4 h-4 text-gray-400" />
@@ -530,8 +678,7 @@ export function Historic({ cpf, onNavigate }: HistoricProps) {
                   type="button"
                   onClick={() => onNavigate?.("generation")}
                   disabled={!cpf}
-                  className="text-[11px] font-semibold text-green-300 hover:text-green-200 transition-colors
-                             disabled:opacity-50"
+                  className="text-[11px] font-semibold text-green-300 hover:text-green-200 transition-colors disabled:opacity-50"
                 >
                   Ver
                 </button>
@@ -544,7 +691,7 @@ export function Historic({ cpf, onNavigate }: HistoricProps) {
                 <div className="flex items-center gap-2">
                   <TrendingDown className="w-5 h-5 text-blue-400" />
                   <span className="text-gray-400 text-[10px] uppercase font-bold tracking-wider">
-                    CONSUMO ({rangeLabel})
+                    CONSUMO ({period.label})
                   </span>
                 </div>
 
@@ -552,8 +699,7 @@ export function Historic({ cpf, onNavigate }: HistoricProps) {
                   type="button"
                   onClick={() => onNavigate?.("consumption")}
                   disabled={!cpf}
-                  className="p-2 rounded-lg border border-gray-700 hover:bg-white/5 transition-colors
-                             disabled:opacity-50 disabled:hover:bg-transparent"
+                  className="p-2 rounded-lg border border-gray-700 hover:bg-white/5 transition-colors disabled:opacity-50 disabled:hover:bg-transparent"
                   title="Abrir página de Consumo"
                 >
                   <ChevronRight className="w-4 h-4 text-gray-400" />
@@ -573,8 +719,7 @@ export function Historic({ cpf, onNavigate }: HistoricProps) {
                   type="button"
                   onClick={() => onNavigate?.("consumption")}
                   disabled={!cpf}
-                  className="text-[11px] font-semibold text-blue-300 hover:text-blue-200 transition-colors
-                             disabled:opacity-50"
+                  className="text-[11px] font-semibold text-blue-300 hover:text-blue-200 transition-colors disabled:opacity-50"
                 >
                   Ver
                 </button>
@@ -582,9 +727,9 @@ export function Historic({ cpf, onNavigate }: HistoricProps) {
             </div>
           </div>
 
-          {/* Agrupado por dia */}
+          {/* Agrupado por dia (PAGINADO) */}
           <div className="space-y-6">
-            {grouped.map((g) => (
+            {paginatedGrouped.map((g) => (
               <div key={g.dateKey} className="space-y-3">
                 <div className="flex flex-col md:flex-row md:items-center md:justify-between gap-3">
                   <div className="flex items-center gap-2 px-3 py-2 rounded-lg border border-gray-800 bg-white/5">
@@ -614,20 +759,18 @@ export function Historic({ cpf, onNavigate }: HistoricProps) {
                   </div>
                 </div>
 
-                {/* Lista por horário (W) */}
+                {/* Lista por horário (DESC) */}
                 <div className="bg-[#1a2942] rounded-xl border border-gray-800 overflow-hidden">
                   {g.items.map((item: any, idx: number) => {
-                    const genW = Math.max(0, toNum(item.solar_generation));
-                    const consW = Math.max(0, toNum(item.house_consumption));
+                    const genW = Math.max(0, toNum(item.active_power));
+                    const tGen = tsToMsSafe(item.created_at);
+                    const consW = findClosestWithin(consPointsAsc, tGen, 15000);
                     const saldoW = genW - consW;
 
-                    const hora = new Date(item.timestamp).toLocaleTimeString(
+                    const hora = new Date(item.created_at).toLocaleTimeString(
                       "pt-BR",
                       { hour: "2-digit", minute: "2-digit", second: "2-digit" },
                     );
-
-                    // ✅ Wh do intervalo (10s)
-                    const genWh = genW * WH_FACTOR;
 
                     return (
                       <div
@@ -646,11 +789,6 @@ export function Historic({ cpf, onNavigate }: HistoricProps) {
                               Tensão:{" "}
                               <span className="text-gray-300">
                                 {toNum(item.voltage)}V
-                              </span>
-                              <span className="text-gray-600"> • </span>
-                              Energia:{" "}
-                              <span className="text-gray-300">
-                                {genWh.toFixed(2)} Wh
                               </span>
                             </div>
                           </div>
@@ -672,10 +810,43 @@ export function Historic({ cpf, onNavigate }: HistoricProps) {
                       </div>
                     );
                   })}
+
+                  {g.items.length === 0 && (
+                    <div className="px-4 py-6 text-center text-gray-400 text-sm">
+                      Sem dados neste dia.
+                    </div>
+                  )}
                 </div>
               </div>
             ))}
           </div>
+
+          {/* Controles de paginação */}
+          {grouped.length > ITEMS_PER_PAGE && (
+            <div className="flex items-center justify-center gap-3 mt-6">
+              <button
+                onClick={() => setCurrentPage((p) => Math.max(1, p - 1))}
+                disabled={currentPage === 1}
+                className="px-3 py-1 text-xs bg-gray-700 rounded disabled:opacity-40"
+              >
+                Anterior
+              </button>
+
+              <span className="text-xs text-gray-400">
+                Página {currentPage} de {totalPages}
+              </span>
+
+              <button
+                onClick={() =>
+                  setCurrentPage((p) => Math.min(totalPages, p + 1))
+                }
+                disabled={currentPage === totalPages}
+                className="px-3 py-1 text-xs bg-gray-700 rounded disabled:opacity-40"
+              >
+                Próxima
+              </button>
+            </div>
+          )}
         </>
       )}
     </div>

@@ -10,29 +10,31 @@ import {
   ResponsiveContainer,
 } from "recharts";
 
+// ✅ cálculo unificado
+import { integrateKwhFromRows, toNum } from "./EnergyCalc";
+
 interface ConsumptionProps {
   cpf: string; // (já vem limpo do Dashboard)
 }
 
+/** ⚠️ AJUSTE AQUI se o nome da tabela for diferente */
+const TABLE_CONSUMO = "consumo";
+
 type Row = {
-  id?: number;
-  timestamp: string;
-  house_consumption: any; // W (ou kW dependendo do seu backend — veja observação abaixo)
+  id?: string | number;
+  created_at: string;
+  active_power: any; // W
 };
 
-const toNum = (v: any) => {
-  const n = Number(v);
-  return Number.isFinite(n) ? n : 0;
-};
-
-const tsToMs = (ts: string) => {
-  const ms = new Date(ts).getTime();
-  return Number.isFinite(ms) ? ms : NaN;
-};
-
-// ✅ Se seu house_consumption estiver em W, use isso (igual geração)
-// ✅ Se ele já estiver em kW, troque para: const wToKw = (w: number) => w;
+// W -> kW
 const wToKw = (w: number) => w / 1000;
+
+// formata CPF "11111111111" -> "111.111.111-11"
+function formatCpfFromDigits(v: string) {
+  const d = (v || "").replace(/\D/g, "").slice(0, 11);
+  if (d.length !== 11) return "";
+  return `${d.slice(0, 3)}.${d.slice(3, 6)}.${d.slice(6, 9)}-${d.slice(9, 11)}`;
+}
 
 // eixo curto: DD/MM HH:MM
 function fmtAxis(ts: string) {
@@ -60,35 +62,14 @@ function fmtTooltip(ts: string) {
   }).format(d);
 }
 
-// integra potência (W) => kWh pelo método do trapézio
-function integrateKwh(
-  rowsAsc: { timestamp: string; house_consumption: any }[],
-) {
-  if (!rowsAsc || rowsAsc.length < 2) return 0;
-
-  let kwh = 0;
-  for (let i = 1; i < rowsAsc.length; i++) {
-    const a = rowsAsc[i - 1];
-    const b = rowsAsc[i];
-
-    const t0 = tsToMs(a.timestamp);
-    const t1 = tsToMs(b.timestamp);
-    if (!Number.isFinite(t0) || !Number.isFinite(t1)) continue;
-
-    const dtHours = Math.max(0, (t1 - t0) / 3600000);
-
-    const p0w = Math.max(0, toNum(a.house_consumption));
-    const p1w = Math.max(0, toNum(b.house_consumption));
-
-    const pAvgKw = (p0w + p1w) / 2 / 1000;
-    kwh += pAvgKw * dtHours;
-  }
-  return kwh;
+function tsToMsSafe(ts: string) {
+  const t = Date.parse(ts);
+  return Number.isFinite(t) ? t : NaN;
 }
 
 export function Consumption({ cpf }: ConsumptionProps) {
-  const [currentW, setCurrentW] = useState(0); // potência atual (W)
-  const [todayKwh, setTodayKwh] = useState(0); // consumo do dia (kWh)
+  const [currentW, setCurrentW] = useState(0);
+  const [todayKwh, setTodayKwh] = useState(0);
   const [chartRows, setChartRows] = useState<Row[]>([]);
   const [loading, setLoading] = useState(true);
   const [dbError, setDbError] = useState("");
@@ -103,21 +84,21 @@ export function Consumption({ cpf }: ConsumptionProps) {
     cpfRef.current = cpf;
   }, [cpf]);
 
+  // cpf variants (caso seu banco guarde com pontuação)
+  const cpfFmt = useMemo(() => formatCpfFromDigits(cpf), [cpf]);
+
   const fetchPersonName = async () => {
     if (!cpf) return;
     setLoadingName(true);
 
     const { data, error } = await supabase
-      .from("customers")
+      .from("clientes") // ✅ customers -> clientes
       .select("name")
       .eq("cpf", cpf)
-      .limit(1);
+      .maybeSingle();
 
-    if (!error && data && data.length > 0) {
-      setPersonName(data[0]?.name || "");
-    } else {
-      setPersonName("");
-    }
+    if (!error && data) setPersonName(data?.name || "");
+    else setPersonName("");
 
     setLoadingName(false);
   };
@@ -136,15 +117,15 @@ export function Consumption({ cpf }: ConsumptionProps) {
     setDbError("");
 
     const { data, error } = await supabase
-      .from("measurements")
-      .select("id,timestamp,house_consumption")
-      .eq("user_cpf", cpf)
-      .order("timestamp", { ascending: false })
+      .from(TABLE_CONSUMO)
+      .select("id,created_at,active_power")
+      .in("user_cpf", cpfFmt ? [cpf, cpfFmt] : [cpf]) // ✅ suporta CPF com/sem máscara
+      .order("created_at", { ascending: false })
       .limit(24);
 
     if (error) {
-      console.error("Consumption measurements error:", error);
-      setDbError(error.message || "Erro ao consultar measurements");
+      console.error("Consumption error:", error);
+      setDbError(error.message || `Erro ao consultar ${TABLE_CONSUMO}`);
       setChartRows([]);
       setCurrentW(0);
       setTodayKwh(0);
@@ -156,11 +137,11 @@ export function Consumption({ cpf }: ConsumptionProps) {
 
     if (rows.length > 0) {
       const newest = rows[0];
-      setCurrentW(toNum(newest.house_consumption));
+      setCurrentW(Math.max(0, toNum(newest.active_power)));
 
       const asc = [...rows]
-        .filter((r) => Number.isFinite(tsToMs(r.timestamp)))
-        .sort((a, b) => tsToMs(a.timestamp) - tsToMs(b.timestamp));
+        .filter((r) => Number.isFinite(tsToMsSafe(r.created_at)))
+        .sort((a, b) => tsToMsSafe(a.created_at) - tsToMsSafe(b.created_at));
 
       setChartRows(asc);
     } else {
@@ -178,23 +159,20 @@ export function Consumption({ cpf }: ConsumptionProps) {
     start.setHours(0, 0, 0, 0);
 
     const { data, error } = await supabase
-      .from("measurements")
-      .select("timestamp,house_consumption")
-      .eq("user_cpf", cpf)
-      .gte("timestamp", start.toISOString())
-      .order("timestamp", { ascending: true })
-      .limit(5000);
+      .from(TABLE_CONSUMO)
+      .select("created_at,active_power")
+      .in("user_cpf", cpfFmt ? [cpf, cpfFmt] : [cpf])
+      .gte("created_at", start.toISOString())
+      .order("created_at", { ascending: true })
+      .limit(100000); // ✅ mantém alto (amostra a cada 10s)
 
     if (error) {
       console.error("fetchTodayConsumptionKwh error:", error);
       return;
     }
 
-    const rows = (data || []) as {
-      timestamp: string;
-      house_consumption: any;
-    }[];
-    const kwh = integrateKwh(rows);
+    const rows = (data || []) as { created_at: string; active_power: any }[];
+    const kwh = integrateKwhFromRows(rows); // ✅ cálculo unificado
     setTodayKwh(Number(kwh.toFixed(3)));
   };
 
@@ -217,7 +195,7 @@ export function Consumption({ cpf }: ConsumptionProps) {
     fetchConsumption();
     fetchTodayKwh();
 
-    // kWh do dia (mais leve)
+    // kWh do dia
     kwhPollId = window.setInterval(() => {
       fetchTodayKwh();
     }, 30000);
@@ -230,26 +208,40 @@ export function Consumption({ cpf }: ConsumptionProps) {
         {
           event: "*",
           schema: "public",
-          table: "measurements",
-          filter: `user_cpf=eq.${cpf}`,
+          table: TABLE_CONSUMO,
+          // ⚠️ filtro do realtime não suporta OR fácil; então deixo sem filtro e filtro no código
         },
         (payload: any) => {
-          const n: Row | null = payload?.new ?? null;
-          if (!n?.timestamp) return;
+          const n: any = payload?.new ?? null;
+          if (!n?.created_at) return;
 
-          setCurrentW(toNum(n.house_consumption));
+          const incomingCpf = String(n.user_cpf || "");
+          const okCpf =
+            incomingCpf === cpf || (cpfFmt && incomingCpf === cpfFmt);
+
+          if (!okCpf) return;
+
+          const row: Row = {
+            id: n.id,
+            created_at: n.created_at,
+            active_power: n.active_power,
+          };
+
+          setCurrentW(Math.max(0, toNum(row.active_power)));
           setDbError("");
 
           setChartRows((prev) => {
-            const map = new Map<number, Row>();
+            const map = new Map<string, Row>();
             for (const r of prev) {
-              if (r.id != null) map.set(r.id, r);
+              if (r.id != null) map.set(String(r.id), r);
             }
-            if (n.id != null) map.set(n.id, n);
+            if (row.id != null) map.set(String(row.id), row);
 
             const arr = Array.from(map.values())
-              .filter((r) => Number.isFinite(tsToMs(r.timestamp)))
-              .sort((a, b) => tsToMs(a.timestamp) - tsToMs(b.timestamp));
+              .filter((r) => Number.isFinite(tsToMsSafe(r.created_at)))
+              .sort(
+                (a, b) => tsToMsSafe(a.created_at) - tsToMsSafe(b.created_at),
+              );
 
             return arr.length > 30 ? arr.slice(arr.length - 30) : arr;
           });
@@ -261,15 +253,19 @@ export function Consumption({ cpf }: ConsumptionProps) {
       if (kwhPollId) window.clearInterval(kwhPollId);
       if (sub) supabase.removeChannel(sub);
     };
-  }, [cpf]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [cpf, cpfFmt]);
 
   const chartData = useMemo(() => {
     if (!chartRows.length) return [];
-    return chartRows.map((r) => ({
-      ts: r.timestamp,
-      label: fmtAxis(r.timestamp),
-      value: Number(wToKw(toNum(r.house_consumption)).toFixed(3)), // kW no gráfico
-    }));
+    return chartRows.map((r) => {
+      const w = Math.max(0, toNum(r.active_power));
+      return {
+        ts: r.created_at,
+        label: fmtAxis(r.created_at),
+        value: Number(wToKw(w).toFixed(3)), // kW no gráfico
+      };
+    });
   }, [chartRows]);
 
   if (!cpf) {
@@ -345,8 +341,8 @@ export function Consumption({ cpf }: ConsumptionProps) {
           <span className="text-xs text-gray-400">kWh</span>
         </div>
         <div className="text-[11px] text-gray-500 mt-1">
-          Calculado pela soma ao longo do tempo usando potência (W) das medições
-          do dia.
+          Calculado pela integração no tempo usando potência (W) das medições do
+          dia.
         </div>
       </div>
 
