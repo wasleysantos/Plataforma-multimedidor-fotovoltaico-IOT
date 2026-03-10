@@ -98,14 +98,12 @@ export function Login({
 
   return (
     <div className="relative w-full min-h-screen flex items-center justify-center overflow-hidden">
-      {/* BACKGROUND */}
-      <div className="fixed inset-0 -z-10 overflow-hidden">
-        <img
-          src={solarBg}
-          alt="Solar background"
-          className="w-full h-full object-cover object-center scale-105"
-        />
-      </div>
+      {/* BACKGROUND FIXO */}
+      <div
+        className="fixed inset-0 -z-10 bg-cover bg-center bg-no-repeat"
+        style={{ backgroundImage: `url(${solarBg})` }}
+      />
+
       {/* Gradiente */}
       <div className="fixed inset-0 -z-10 bg-gradient-to-br from-[#0a1628]/90 via-[#0a1628]/80 to-[#071224]/95 pointer-events-none" />
 
