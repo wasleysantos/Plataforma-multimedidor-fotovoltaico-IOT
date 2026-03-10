@@ -10,10 +10,16 @@ import {
 } from "recharts";
 import { supabase } from "../lib/supabase";
 
-type Row = {
+type GenRow = {
   id: number;
   created_at: string;
-  active_power: any; // kW (potência) (mantive comentário do seu código)
+  active_power: any; // potência (W ou kW, depende do seu banco)
+};
+
+type ConsRow = {
+  id: number;
+  created_at: string;
+  active_power: any; // potência (W ou kW, depende do seu banco)
 };
 
 type RangeKey = "24h" | "7d" | "30d";
@@ -77,12 +83,39 @@ function fmtTooltip(ts: string) {
   }).format(d);
 }
 
-function buildSeries(points: { ts: string; genKw: number }[], tarifa: number) {
+// ===== CPF variants (limpo + mascarado) =====
+const normalizeCpf = (value: string) =>
+  (value || "").replace(/\D/g, "").slice(0, 11);
+
+const maskCPF = (value: string) => {
+  const v = normalizeCpf(value);
+  const p1 = v.slice(0, 3);
+  const p2 = v.slice(3, 6);
+  const p3 = v.slice(6, 9);
+  const p4 = v.slice(9, 11);
+
+  let out = p1;
+  if (p2) out += `.${p2}`;
+  if (p3) out += `.${p3}`;
+  if (p4) out += `-${p4}`;
+  return out;
+};
+
+type Point = { ts: string; genKw: number; consKw: number };
+
+function buildSeries(points: Point[], tarifa: number) {
+  // economia acumulada baseada apenas em geração (mantém seu comportamento)
   let kwhAcum = 0;
 
   return points.map((p, i) => {
     if (i === 0) {
-      return { ts: p.ts, label: "", gen_kw: p.genKw, brl_econ: 0 };
+      return {
+        ts: p.ts,
+        label: "",
+        gen_kw: p.genKw,
+        cons_kw: p.consKw,
+        brl_econ: 0,
+      };
     }
 
     const t0 = tsToMs(points[i - 1].ts);
@@ -99,6 +132,7 @@ function buildSeries(points: { ts: string; genKw: number }[], tarifa: number) {
       ts: p.ts,
       label: "",
       gen_kw: p.genKw,
+      cons_kw: p.consKw,
       brl_econ: Number((kwhAcum * tarifa).toFixed(2)),
     };
   });
@@ -107,7 +141,8 @@ function buildSeries(points: { ts: string; genKw: number }[], tarifa: number) {
 const FALLBACK_TARIFA_MA = 0.85;
 
 export function PowerChart({ cpf }: { cpf: string }) {
-  const [rows, setRows] = useState<Row[]>([]);
+  const [genRows, setGenRows] = useState<GenRow[]>([]);
+  const [consRows, setConsRows] = useState<ConsRow[]>([]);
   const [loading, setLoading] = useState(false);
   const [dbError, setDbError] = useState("");
 
@@ -123,6 +158,14 @@ export function PowerChart({ cpf }: { cpf: string }) {
     rangeRef.current = range;
   }, [range]);
 
+  const cpfVariants = useMemo(() => {
+    const clean = normalizeCpf(cpf);
+    if (!clean) return [];
+    const masked = maskCPF(clean);
+    return Array.from(new Set([clean, masked]));
+  }, [cpf]);
+
+  // Tarifa
   useEffect(() => {
     const fetchTarifa = async () => {
       if (!cpf) {
@@ -135,10 +178,12 @@ export function PowerChart({ cpf }: { cpf: string }) {
       setTarifaLoading(true);
       setTarifaError("");
 
+      const clean = normalizeCpf(cpf);
+
       const { data, error } = await supabase
         .from("clientes")
         .select("tarifa_kwh")
-        .eq("cpf", cpf)
+        .eq("cpf", clean)
         .maybeSingle();
 
       if (error) {
@@ -158,10 +203,12 @@ export function PowerChart({ cpf }: { cpf: string }) {
     fetchTarifa();
   }, [cpf]);
 
+  // Fetch gráfico (GERAÇÃO + CONSUMO)
   useEffect(() => {
     const fetchChart = async () => {
       if (!cpf) {
-        setRows([]);
+        setGenRows([]);
+        setConsRows([]);
         setDbError("");
         setLoading(false);
         return;
@@ -171,89 +218,154 @@ export function PowerChart({ cpf }: { cpf: string }) {
       setDbError("");
 
       const since = sinceIso(range);
+      const variants = cpfVariants.length ? cpfVariants : [cpf];
 
-      const { data, error } = await supabase
-        .from("geracao")
-        .select("id,created_at,active_power") // ✅ removido house_consumption
-        .eq("user_cpf", cpf)
-        .gte("created_at", since)
-        .order("created_at", { ascending: true });
+      const [genRes, consRes] = await Promise.all([
+        supabase
+          .from("geracao")
+          .select("id,created_at,active_power")
+          .in("user_cpf", variants)
+          .gte("created_at", since)
+          .order("created_at", { ascending: true }),
 
-      if (error) {
-        console.error("PowerChart geracao error:", error);
-        setDbError(error.message || "Erro ao consultar geracao");
-        setRows([]);
+        supabase
+          .from("consumo")
+          .select("id,created_at,active_power")
+          .in("user_cpf", variants)
+          .gte("created_at", since)
+          .order("created_at", { ascending: true }),
+      ]);
+
+      if (genRes.error || consRes.error) {
+        console.error("PowerChart error:", genRes.error || consRes.error);
+        setDbError(
+          genRes.error?.message ||
+            consRes.error?.message ||
+            "Erro ao consultar geracao/consumo",
+        );
+        setGenRows([]);
+        setConsRows([]);
         setLoading(false);
         return;
       }
 
-      setRows((data as Row[]) || []);
+      setGenRows((genRes.data as GenRow[]) || []);
+      setConsRows((consRes.data as ConsRow[]) || []);
       setLoading(false);
     };
 
     fetchChart();
-  }, [cpf, range]);
+  }, [cpf, range, cpfVariants]);
 
+  // Realtime: channels para CPF limpo e mascarado (se forem diferentes)
   useEffect(() => {
     if (!cpf) return;
 
-    const channel = supabase
-      .channel(`realtime-powerchart-${cpf}`)
-      .on(
-        "postgres_changes",
-        {
-          event: "*",
-          schema: "public",
-          table: "geracao",
-          filter: `user_cpf=eq.${cpf}`,
-        },
-        (payload: any) => {
-          const r: Row | null = payload?.new ?? null;
-          if (!r?.id) return;
+    const variants = cpfVariants.length ? cpfVariants : [cpf];
+    const channels: any[] = [];
 
-          const currentRange = rangeRef.current;
+    const subTable = (table: "geracao" | "consumo", userCpf: string) => {
+      const ch = supabase
+        .channel(`realtime-powerchart-${table}-${userCpf}`)
+        .on(
+          "postgres_changes",
+          {
+            event: "*",
+            schema: "public",
+            table,
+            filter: `user_cpf=eq.${userCpf}`,
+          },
+          (payload: any) => {
+            const r = payload?.new;
+            if (!r?.id || !r?.created_at) return;
 
-          if (!inWindow(r.created_at, currentRange)) {
-            setRows((prev) => prev.filter((x) => x.id !== r.id));
-            return;
-          }
+            const currentRange = rangeRef.current;
 
-          setRows((prev) => {
-            const map = new Map<number, Row>();
-            for (const x of prev) map.set(x.id, x);
-            map.set(r.id, r);
+            if (!inWindow(r.created_at, currentRange)) {
+              if (table === "geracao") {
+                setGenRows((prev) => prev.filter((x) => x.id !== r.id));
+              } else {
+                setConsRows((prev) => prev.filter((x) => x.id !== r.id));
+              }
+              return;
+            }
 
-            const ordered = Array.from(map.values())
-              .filter((x) => Number.isFinite(tsToMs(x.created_at)))
-              .sort((a, b) => tsToMs(a.created_at) - tsToMs(b.created_at));
+            const upsert = <T extends { id: number; created_at: string }>(
+              prev: T[],
+            ) => {
+              const map = new Map<number, T>();
+              for (const x of prev) map.set(x.id, x);
+              map.set(r.id, r as T);
 
-            const cutoff =
-              Date.now() - hoursForRange(currentRange) * 60 * 60 * 1000;
+              const ordered = Array.from(map.values())
+                .filter((x) => Number.isFinite(tsToMs(x.created_at)))
+                .sort((a, b) => tsToMs(a.created_at) - tsToMs(b.created_at));
 
-            return ordered.filter((x) => tsToMs(x.created_at) >= cutoff);
-          });
+              const cutoff =
+                Date.now() - hoursForRange(currentRange) * 60 * 60 * 1000;
 
-          setDbError("");
-        },
-      )
-      .subscribe();
+              return ordered.filter((x) => tsToMs(x.created_at) >= cutoff);
+            };
+
+            if (table === "geracao") setGenRows((prev) => upsert(prev));
+            else setConsRows((prev) => upsert(prev));
+
+            setDbError("");
+          },
+        )
+        .subscribe();
+
+      channels.push(ch);
+    };
+
+    for (const v of variants) {
+      subTable("geracao", v);
+      subTable("consumo", v);
+    }
 
     return () => {
-      supabase.removeChannel(channel);
+      for (const ch of channels) supabase.removeChannel(ch);
     };
-  }, [cpf]);
+  }, [cpf, cpfVariants]);
 
+  // Monta dados do gráfico (merge por timestamp + forward-fill)
   const chartData = useMemo(() => {
-    if (!rows || rows.length === 0) return [];
-
-    const ordered = [...rows]
+    const g = [...(genRows || [])]
       .filter((r) => Number.isFinite(tsToMs(r.created_at)))
-      .sort((a, b) => tsToMs(a.created_at) - tsToMs(b.created_at));
+      .sort((a, b) => tsToMs(a.created_at) - tsToMs(b.created_at))
+      .map((r) => ({
+        ts: r.created_at,
+        gen: Math.max(0, toNum(r.active_power)),
+      }));
 
-    const points = ordered.map((r) => ({
-      ts: r.created_at,
-      genKw: Math.max(0, toNum(r.active_power)),
-    }));
+    const c = [...(consRows || [])]
+      .filter((r) => Number.isFinite(tsToMs(r.created_at)))
+      .sort((a, b) => tsToMs(a.created_at) - tsToMs(b.created_at))
+      .map((r) => ({
+        ts: r.created_at,
+        cons: Math.max(0, toNum(r.active_power)),
+      }));
+
+    if (g.length === 0 && c.length === 0) return [];
+
+    const map = new Map<string, { ts: string; gen?: number; cons?: number }>();
+    for (const x of g)
+      map.set(x.ts, { ...(map.get(x.ts) || { ts: x.ts }), gen: x.gen });
+    for (const x of c)
+      map.set(x.ts, { ...(map.get(x.ts) || { ts: x.ts }), cons: x.cons });
+
+    const merged = Array.from(map.values()).sort(
+      (a, b) => tsToMs(a.ts) - tsToMs(b.ts),
+    );
+
+    let lastGen = 0;
+    let lastCons = 0;
+
+    const points: Point[] = merged.map((m) => {
+      if (typeof m.gen === "number") lastGen = m.gen;
+      if (typeof m.cons === "number") lastCons = m.cons;
+      return { ts: m.ts, genKw: lastGen, consKw: lastCons };
+    });
 
     const series = buildSeries(points, tarifaKwh || 0);
 
@@ -261,7 +373,7 @@ export function PowerChart({ cpf }: { cpf: string }) {
       ...s,
       label: fmtAxis(s.ts, range),
     }));
-  }, [rows, tarifaKwh, range]);
+  }, [genRows, consRows, tarifaKwh, range]);
 
   const ZoomButton = ({ k, label }: { k: RangeKey; label: string }) => (
     <button
@@ -330,7 +442,10 @@ export function PowerChart({ cpf }: { cpf: string }) {
     );
   }
 
-  const yKey = mode === "KW" ? "gen_kw" : "brl_econ";
+  const yTick = (value: any) =>
+    mode === "BRL_ECON"
+      ? `R$ ${Number(value).toFixed(0)}`
+      : Number(value).toFixed(1);
 
   return (
     <div className="w-full">
@@ -374,9 +489,16 @@ export function PowerChart({ cpf }: { cpf: string }) {
       <ResponsiveContainer width="100%" height={220}>
         <AreaChart data={chartData}>
           <defs>
-            <linearGradient id="mainGradient" x1="0" y1="0" x2="0" y2="1">
+            {/* Geração */}
+            <linearGradient id="genGradient" x1="0" y1="0" x2="0" y2="1">
               <stop offset="5%" stopColor="#22c55e" stopOpacity={0.8} />
               <stop offset="95%" stopColor="#22c55e" stopOpacity={0.1} />
+            </linearGradient>
+
+            {/* Consumo */}
+            <linearGradient id="consGradient" x1="0" y1="0" x2="0" y2="1">
+              <stop offset="5%" stopColor="#f59e0b" stopOpacity={0.7} />
+              <stop offset="95%" stopColor="#f59e0b" stopOpacity={0.08} />
             </linearGradient>
           </defs>
 
@@ -392,11 +514,7 @@ export function PowerChart({ cpf }: { cpf: string }) {
             stroke="#64748b"
             style={{ fontSize: "12px" }}
             tickLine={false}
-            tickFormatter={(value) =>
-              mode === "BRL_ECON"
-                ? `R$ ${Number(value).toFixed(0)}`
-                : Number(value).toFixed(1)
-            }
+            tickFormatter={yTick}
           />
 
           <Tooltip
@@ -406,10 +524,10 @@ export function PowerChart({ cpf }: { cpf: string }) {
                 ? `Atualizado em: ${fmtTooltip(ts)}`
                 : "Atualizado em: --";
             }}
-            formatter={(value: any) => {
-              if (mode === "KW")
-                return [`${Number(value).toFixed(2)} kW`, "Geração"];
-              return [`R$ ${Number(value).toFixed(2)}`, "Economizado (acum.)"];
+            formatter={(value: any, name: string) => {
+              if (mode === "BRL_ECON")
+                return [`R$ ${Number(value).toFixed(2)}`, name];
+              return [`${Number(value).toFixed(2)} kW`, name];
             }}
             contentStyle={{
               backgroundColor: "#1a2942",
@@ -424,15 +542,39 @@ export function PowerChart({ cpf }: { cpf: string }) {
             iconType="line"
           />
 
-          <Area
-            type="monotone"
-            dataKey={yKey}
-            name={mode === "KW" ? "Geração (kW)" : "Economia em R$ (acum.)"}
-            stroke="#22c55e"
-            strokeWidth={2}
-            fillOpacity={1}
-            fill="url(#mainGradient)"
-          />
+          {mode === "BRL_ECON" ? (
+            <Area
+              type="monotone"
+              dataKey="brl_econ"
+              name="Economia (acum.)"
+              stroke="#22c55e"
+              strokeWidth={2}
+              fillOpacity={1}
+              fill="url(#genGradient)"
+            />
+          ) : (
+            <>
+              <Area
+                type="monotone"
+                dataKey="gen_kw"
+                name="Geração (kW)"
+                stroke="#22c55e"
+                strokeWidth={2}
+                fillOpacity={1}
+                fill="url(#genGradient)"
+              />
+
+              <Area
+                type="monotone"
+                dataKey="cons_kw"
+                name="Consumo (kW)"
+                stroke="#f59e0b"
+                strokeWidth={2}
+                fillOpacity={1}
+                fill="url(#consGradient)"
+              />
+            </>
+          )}
         </AreaChart>
       </ResponsiveContainer>
     </div>

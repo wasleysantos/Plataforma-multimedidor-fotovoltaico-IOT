@@ -42,6 +42,8 @@ type Screen =
   | "settings"
   | "customer_register";
 
+type CardRange = "realtime" | "month";
+
 const normalizeCpf = (value: string) =>
   (value || "").replace(/\D/g, "").slice(0, 11);
 
@@ -57,6 +59,22 @@ const maskCPF = (value: string) => {
   if (p3) out += `.${p3}`;
   if (p4) out += `-${p4}`;
   return out;
+};
+
+const formatDateTime = (value?: string | null) => {
+  if (!value) return "—";
+
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return "—";
+
+  return new Intl.DateTimeFormat("pt-BR", {
+    day: "2-digit",
+    month: "2-digit",
+    year: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+  }).format(date);
 };
 
 export function Dashboard({ user, onLogout }: DashboardProps) {
@@ -76,7 +94,10 @@ export function Dashboard({ user, onLogout }: DashboardProps) {
   const [nameNotFound, setNameNotFound] = useState(false);
   const [loadingName, setLoadingName] = useState(false);
 
-  const [lastUpdate, setLastUpdate] = useState<string>("—");
+  const [lastGenUpdate, setLastGenUpdate] = useState<string>("—");
+  const [lastConsUpdate, setLastConsUpdate] = useState<string>("—");
+
+  const [cardRange, setCardRange] = useState<CardRange>("month");
 
   const [realData, setRealData] = useState({
     voltage: 0,
@@ -87,26 +108,17 @@ export function Dashboard({ user, onLogout }: DashboardProps) {
     status: "Offline" as "Online" | "Offline",
   });
 
-  // ✅ kWh DO MÊS (GERAÇÃO)
   const [monthKwh, setMonthKwh] = useState(0);
   const [monthKwhError, setMonthKwhError] = useState("");
 
-  // ✅ kWh DO MÊS (CONSUMO)
   const [monthConsKwh, setMonthConsKwh] = useState(0);
   const [monthConsKwhError, setMonthConsKwhError] = useState("");
 
-  // ✅ SALDO (MÊS) = geração - consumo
   const monthBalanceKwh = useMemo(() => {
     const v = monthKwh - monthConsKwh;
-    // evita "-0.00"
     return Math.abs(v) < 0.0005 ? 0 : v;
   }, [monthKwh, monthConsKwh]);
 
-  const balanceColor: "green" | "red" = monthBalanceKwh >= 0 ? "green" : "red";
-
-  // ==============================
-  // ✅ CONTROLE DO SISTEMA (device_status)
-  // ==============================
   const DEVICE_GERACAO = "ESP32_PZEM_TESTE";
 
   const [relayState, setRelayState] = useState<boolean | null>(null);
@@ -166,7 +178,6 @@ export function Dashboard({ user, onLogout }: DashboardProps) {
     setRelayLoading(false);
   };
 
-  // ✅ tenta CPF com e sem máscara (porque consumo no CSV está mascarado)
   const cpfVariants = useMemo(() => {
     if (!targetCPF) return [];
     const clean = normalizeCpf(targetCPF);
@@ -179,25 +190,42 @@ export function Dashboard({ user, onLogout }: DashboardProps) {
 
     setDbError("");
 
-    const { data, error } = await supabase
-      .from("geracao")
-      .select("*")
-      .eq("user_cpf", targetCPF)
-      .order("created_at", { ascending: false })
-      .limit(1);
+    const variants = cpfVariants.length ? cpfVariants : [targetCPF];
 
-    if (error) {
-      console.error("Erro geracao:", {
-        message: error.message,
-        details: (error as any).details,
-        hint: (error as any).hint,
-        code: (error as any).code,
+    const [genRes, consRes] = await Promise.all([
+      supabase
+        .from("geracao")
+        .select("*")
+        .in("user_cpf", variants)
+        .order("created_at", { ascending: false })
+        .limit(1),
+      supabase
+        .from("consumo")
+        .select("created_at,active_power")
+        .in("user_cpf", variants)
+        .order("created_at", { ascending: false })
+        .limit(1),
+    ]);
+
+    const genError = genRes.error;
+    const consError = consRes.error;
+
+    if (genError || consError) {
+      const msg =
+        genError?.message ||
+        consError?.message ||
+        "Erro ao consultar geração/consumo";
+
+      console.error("Erro geração/consumo:", {
+        genError,
+        consError,
         targetCPF,
+        variants,
       });
-      setDbError(error.message || "Erro ao consultar geracao");
-      setCpfNotFound(false);
 
-      setLastUpdate("—");
+      setDbError(msg);
+      setLastGenUpdate("—");
+      setLastConsUpdate("—");
       setRealData({
         voltage: 0,
         current: 0,
@@ -206,11 +234,16 @@ export function Dashboard({ user, onLogout }: DashboardProps) {
         netW: 0,
         status: "Offline",
       });
+      setCpfNotFound(false);
       return;
     }
 
-    if (!data || data.length === 0) {
-      setLastUpdate("—");
+    const genData = genRes.data || [];
+    const consData = consRes.data || [];
+
+    if (genData.length === 0 && consData.length === 0) {
+      setLastGenUpdate("—");
+      setLastConsUpdate("—");
       setRealData({
         voltage: 0,
         current: 0,
@@ -223,27 +256,19 @@ export function Dashboard({ user, onLogout }: DashboardProps) {
       return;
     }
 
-    const row: any = data[0];
+    const genRow: any = genData[0] || null;
+    const consRow: any = consData[0] || null;
 
-    const formattedDate = row?.created_at
-      ? new Intl.DateTimeFormat("pt-BR", {
-          day: "2-digit",
-          month: "2-digit",
-          year: "numeric",
-          hour: "2-digit",
-          minute: "2-digit",
-          second: "2-digit",
-        }).format(new Date(row.created_at))
-      : "—";
-    setLastUpdate(formattedDate);
+    setLastGenUpdate(formatDateTime(genRow?.created_at));
+    setLastConsUpdate(formatDateTime(consRow?.created_at));
 
-    const solarW = toNum(row.active_power);
-    const consW = 0;
-    const netW = solarW;
+    const solarW = toNum(genRow?.active_power);
+    const consW = toNum(consRow?.active_power);
+    const netW = solarW - consW;
 
     setRealData({
-      voltage: toNum(row.voltage),
-      current: toNum(row.current),
+      voltage: toNum(genRow?.voltage),
+      current: toNum(genRow?.current),
       solarW,
       consW,
       netW,
@@ -253,7 +278,6 @@ export function Dashboard({ user, onLogout }: DashboardProps) {
     setCpfNotFound(false);
   };
 
-  // ✅ kWh DO MÊS (GERAÇÃO)
   const calcMonthKwh = async () => {
     if (!targetCPF) return;
 
@@ -263,10 +287,12 @@ export function Dashboard({ user, onLogout }: DashboardProps) {
     start.setDate(1);
     start.setHours(0, 0, 0, 0);
 
+    const variants = cpfVariants.length ? cpfVariants : [targetCPF];
+
     const { data, error } = await supabase
       .from("geracao")
       .select("created_at,active_power")
-      .eq("user_cpf", targetCPF)
+      .in("user_cpf", variants)
       .gte("created_at", start.toISOString())
       .order("created_at", { ascending: true })
       .limit(100000);
@@ -279,11 +305,9 @@ export function Dashboard({ user, onLogout }: DashboardProps) {
 
     const rows = (data || []) as { created_at: string; active_power: any }[];
     const kwh = integrateKwhFromRows(rows);
-
     setMonthKwh(Number(kwh.toFixed(3)));
   };
 
-  // ✅ kWh DO MÊS (CONSUMO)
   const calcMonthConsKwh = async () => {
     if (!targetCPF) return;
 
@@ -293,11 +317,7 @@ export function Dashboard({ user, onLogout }: DashboardProps) {
     start.setDate(1);
     start.setHours(0, 0, 0, 0);
 
-    const variants = cpfVariants;
-    if (!variants.length) {
-      setMonthConsKwh(0);
-      return;
-    }
+    const variants = cpfVariants.length ? cpfVariants : [targetCPF];
 
     const { data, error } = await supabase
       .from("consumo")
@@ -315,7 +335,6 @@ export function Dashboard({ user, onLogout }: DashboardProps) {
 
     const rows = (data || []) as { created_at: string; active_power: any }[];
     const kwh = integrateKwhFromRows(rows);
-
     setMonthConsKwh(Number(kwh.toFixed(3)));
   };
 
@@ -425,7 +444,8 @@ export function Dashboard({ user, onLogout }: DashboardProps) {
   }, [searchInput]);
 
   useEffect(() => {
-    let subscription: any = null;
+    let genSub: any = null;
+    let consSub: any = null;
     let relaySub: any = null;
     let pollId: number | null = null;
     let kwhPollId: number | null = null;
@@ -447,7 +467,7 @@ export function Dashboard({ user, onLogout }: DashboardProps) {
         calcMonthConsKwh();
       }, 15000);
 
-      subscription = supabase
+      genSub = supabase
         .channel(`realtime-geracao-${targetCPF}`)
         .on(
           "postgres_changes",
@@ -457,36 +477,25 @@ export function Dashboard({ user, onLogout }: DashboardProps) {
             table: "geracao",
             filter: `user_cpf=eq.${targetCPF}`,
           },
-          (payload: any) => {
-            const n = payload?.new;
-            if (!n) return;
+          () => {
+            fetchLatestData();
+            setDbError("");
+          },
+        )
+        .subscribe();
 
-            const formatted = n?.created_at
-              ? new Intl.DateTimeFormat("pt-BR", {
-                  day: "2-digit",
-                  month: "2-digit",
-                  year: "numeric",
-                  hour: "2-digit",
-                  minute: "2-digit",
-                  second: "2-digit",
-                }).format(new Date(n.created_at))
-              : "—";
-            setLastUpdate(formatted);
-
-            const solarW = toNum(n.active_power);
-            const consW = toNum(n.house_consumption);
-            const netW = solarW - consW;
-
-            setRealData({
-              voltage: toNum(n.voltage),
-              current: toNum(n.current),
-              solarW,
-              consW,
-              netW,
-              status: "Online",
-            });
-
-            setCpfNotFound(false);
+      consSub = supabase
+        .channel(`realtime-consumo-${targetCPF}`)
+        .on(
+          "postgres_changes",
+          {
+            event: "*",
+            schema: "public",
+            table: "consumo",
+            filter: `user_cpf=eq.${targetCPF}`,
+          },
+          () => {
+            fetchLatestData();
             setDbError("");
           },
         )
@@ -509,7 +518,8 @@ export function Dashboard({ user, onLogout }: DashboardProps) {
         )
         .subscribe();
     } else {
-      setLastUpdate("—");
+      setLastGenUpdate("—");
+      setLastConsUpdate("—");
       setRealData({
         voltage: 0,
         current: 0,
@@ -535,7 +545,8 @@ export function Dashboard({ user, onLogout }: DashboardProps) {
     }
 
     return () => {
-      if (subscription) supabase.removeChannel(subscription);
+      if (genSub) supabase.removeChannel(genSub);
+      if (consSub) supabase.removeChannel(consSub);
       if (relaySub) supabase.removeChannel(relaySub);
       if (pollId) window.clearInterval(pollId);
       if (kwhPollId) window.clearInterval(kwhPollId);
@@ -560,6 +571,37 @@ export function Dashboard({ user, onLogout }: DashboardProps) {
     }).format(now);
   }, [now]);
 
+  const generationLabel =
+    cardRange === "realtime" ? "Geração (Tempo real)" : "Geração (Mês)";
+  const consumptionLabel =
+    cardRange === "realtime" ? "Consumo (Tempo real)" : "Consumo (Mês)";
+  const balanceLabel =
+    cardRange === "realtime" ? "Saldo (Tempo real)" : "Saldo (Mês)";
+
+  const generationValue =
+    cardRange === "realtime"
+      ? `${realData.solarW.toFixed(2)} W`
+      : `${monthKwh.toFixed(2)} kWh`;
+
+  const consumptionValue =
+    cardRange === "realtime"
+      ? `${realData.consW.toFixed(2)} W`
+      : `${monthConsKwh.toFixed(2)} kWh`;
+
+  const balanceValue =
+    cardRange === "realtime"
+      ? `${realData.netW >= 0 ? "+" : ""}${realData.netW.toFixed(2)} W`
+      : `${monthBalanceKwh >= 0 ? "+" : ""}${monthBalanceKwh.toFixed(2)} kWh`;
+
+  const currentBalanceColor: "green" | "red" =
+    cardRange === "realtime"
+      ? realData.netW >= 0
+        ? "green"
+        : "red"
+      : monthBalanceKwh >= 0
+        ? "green"
+        : "red";
+
   const renderScreen = () => {
     switch (currentScreen) {
       case "monitoring":
@@ -567,7 +609,7 @@ export function Dashboard({ user, onLogout }: DashboardProps) {
           <Monitoring
             cpf={targetCPF}
             status={realData.status}
-            lastUpdate={lastUpdate}
+            lastUpdate={`Geração: ${lastGenUpdate} | Consumo: ${lastConsUpdate}`}
             voltage={realData.voltage}
             current={realData.current}
             solarW={realData.solarW}
@@ -655,7 +697,6 @@ export function Dashboard({ user, onLogout }: DashboardProps) {
       default:
         return (
           <>
-            {/* Filtro CPF */}
             <div className="mb-4">
               <div className="flex gap-3 items-center justify-center">
                 <div className="w-56 sm:w-72">
@@ -700,12 +741,17 @@ export function Dashboard({ user, onLogout }: DashboardProps) {
                   Erro ao consultar o banco: {dbError}
                 </div>
               )}
+
+              {!inputError && !dbError && cpfNotFound && targetCPF && (
+                <div className="flex items-center gap-1 mt-2 text-yellow-400 text-[10px] font-bold uppercase tracking-wider ml-2">
+                  <AlertCircle className="w-3 h-3" />
+                  Nenhum dado encontrado para este CPF
+                </div>
+              )}
             </div>
 
-            {/* 📌 Monitoramento - CPF + Nome + Atualização + Relógio */}
             <div className="mb-4 rounded-2xl bg-zinc-900/60 border border-zinc-800 p-4 backdrop-blur-md shadow-lg">
               <div className="flex items-center justify-between gap-4">
-                {/* 🔎 Lado esquerdo */}
                 <div className="flex flex-col space-y-1">
                   <span className="text-[11px] suppercase tracking-wider text-gray-300">
                     Monitorando:
@@ -732,18 +778,27 @@ export function Dashboard({ user, onLogout }: DashboardProps) {
                               : ""}
                       </div>
 
-                      <div className="flex items-center gap-1 text-[11px] text-gray-400">
-                        <span className="w-2 h-2 rounded-full bg-green-500 animate-pulse"></span>
-                        Última atualização:
-                        <span className="text-gray-300 font-medium text-green-400">
-                          {lastUpdate}
-                        </span>
+                      <div className="flex flex-col gap-1 text-[11px] text-gray-400">
+                        <div className="flex items-center gap-1">
+                          <span className="w-2 h-2 rounded-full bg-green-500 animate-pulse"></span>
+                          Última geração:
+                          <span className="text-gray-300 font-medium text-green-400">
+                            {lastGenUpdate}
+                          </span>
+                        </div>
+
+                        <div className="flex items-center gap-1">
+                          <span className="w-2 h-2 rounded-full bg-yellow-400 animate-pulse"></span>
+                          Último consumo:
+                          <span className="text-gray-300 font-medium text-yellow-400">
+                            {lastConsUpdate}
+                          </span>
+                        </div>
                       </div>
                     </>
                   )}
                 </div>
 
-                {/* 🕒 Lado direito - Relógio */}
                 <div className="text-right">
                   <div className="text-2xl font-bold text-white tracking-tight">
                     {timeText}
@@ -755,30 +810,57 @@ export function Dashboard({ user, onLogout }: DashboardProps) {
               </div>
             </div>
 
-            {/* ✅ CARDS (MÊS): Geração/Consumo/Saldo/Status */}
+            <div className="flex items-center justify-between mb-3">
+              <h3 className="text-white text-sm font-semibold">
+                Resumo energético
+              </h3>
+
+              <div className="flex bg-[#1a2942] rounded-xl p-1 border border-gray-700">
+                <button
+                  onClick={() => setCardRange("realtime")}
+                  className={`px-3 py-1.5 rounded-lg text-xs font-semibold transition-all ${
+                    cardRange === "realtime"
+                      ? "bg-green-500 text-[#0a1628]"
+                      : "text-gray-300 hover:text-white"
+                  }`}
+                >
+                  Tempo real
+                </button>
+
+                <button
+                  onClick={() => setCardRange("month")}
+                  className={`px-3 py-1.5 rounded-lg text-xs font-semibold transition-all ${
+                    cardRange === "month"
+                      ? "bg-green-500 text-[#0a1628]"
+                      : "text-gray-300 hover:text-white"
+                  }`}
+                >
+                  Mês
+                </button>
+              </div>
+            </div>
+
             <div className="grid grid-cols-2 md:grid-cols-4 gap-2 mb-3">
               <MetricsCard
                 icon={<Sun className="w-4 h-4" />}
-                label="Geração (Mês)"
-                value={`${monthKwh.toFixed(2)} kWh`}
+                label={generationLabel}
+                value={generationValue}
                 color="green"
               />
 
               <MetricsCard
                 icon={<Plug className="w-4 h-4" />}
-                label="Consumo (Mês)"
-                value={`${monthConsKwh.toFixed(2)} kWh`}
+                label={consumptionLabel}
+                value={consumptionValue}
                 color="yellow"
               />
 
               <MetricsCard
                 icon={<Zap className="w-4 h-4" />}
-                label="Saldo (Mês)"
-                value={`${monthBalanceKwh >= 0 ? "+" : ""}${monthBalanceKwh.toFixed(
-                  2,
-                )} kWh`}
-                color={balanceColor === "green" ? "green" : "red"}
-                valueColor={balanceColor}
+                label={balanceLabel}
+                value={balanceValue}
+                color={currentBalanceColor === "green" ? "green" : "red"}
+                valueColor={currentBalanceColor}
               />
 
               <MetricsCard
@@ -808,7 +890,7 @@ export function Dashboard({ user, onLogout }: DashboardProps) {
               />
             </div>
 
-            {(monthKwhError || monthConsKwhError) && (
+            {cardRange === "month" && (monthKwhError || monthConsKwhError) && (
               <div className="flex flex-col gap-1 -mt-2 mb-3">
                 {monthKwhError && (
                   <div className="flex items-center gap-1 text-yellow-400 text-[10px] font-bold uppercase tracking-wider">
@@ -825,7 +907,6 @@ export function Dashboard({ user, onLogout }: DashboardProps) {
               </div>
             )}
 
-            {/* Chart */}
             <div className="bg-[#1a2942] rounded-2xl p-4 mb-6">
               <h3 className="text-white font-semibold mb-2 text-sm">
                 Carga Atual
@@ -835,7 +916,6 @@ export function Dashboard({ user, onLogout }: DashboardProps) {
               </div>
             </div>
 
-            {/* Status do sistema */}
             <div className="mb-2 text-xs text-gray-300">
               Sistema:{" "}
               <span
@@ -855,7 +935,6 @@ export function Dashboard({ user, onLogout }: DashboardProps) {
               </span>
             </div>
 
-            {/* BOTÃO TOGGLE */}
             <button
               onClick={toggleSystemPower}
               disabled={relayLoading || relayState === null || !targetCPF}
@@ -922,139 +1001,134 @@ export function Dashboard({ user, onLogout }: DashboardProps) {
       </header>
 
       {menuOpen && (
-  <div
-    className="fixed inset-0 z-50 bg-black/50"
-    onClick={() => setMenuOpen(false)}
-  >
-    <div
-      // painel do menu: fixed e z ainda maior para garantir que fique sobre a imagem/header
-      className="fixed left-0 top-0 bottom-0 w-64 bg-[#1a2942] p-6 z-60"
-      onClick={(e) => e.stopPropagation()}
-    >
-      {/* Usuário */}
-      <div className="mb-6 flex items-center gap-3 bg-[#0f1f35] p-5 rounded-xl border border-gray-800">
-        {/* Avatar */}
-        <div className="w-12 h-12 rounded-full bg-green-500/20 flex items-center justify-center text-green-400 font-bold text-lg">
-          {user?.name
-            ? user.name.charAt(0).toUpperCase()
-            : user?.email?.charAt(0).toUpperCase()}
+        <div
+          className="fixed inset-0 z-50 bg-black/50"
+          onClick={() => setMenuOpen(false)}
+        >
+          <div
+            className="fixed left-0 top-0 bottom-0 w-64 bg-[#1a2942] p-6 z-60"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="mb-6 flex items-center gap-3 bg-[#0f1f35] p-5 rounded-xl border border-gray-800">
+              <div className="w-12 h-12 rounded-full bg-green-500/20 flex items-center justify-center text-green-400 font-bold text-lg">
+                {user?.name
+                  ? user.name.charAt(0).toUpperCase()
+                  : user?.email?.charAt(0).toUpperCase()}
+              </div>
+
+              <div className="flex flex-col min-w-0">
+                <span className="text-white font-semibold text-sm truncate">
+                  {user?.name ? user.name.split(" ")[0] : "Usuário"}
+                </span>
+                <span className="text-gray-400 text-xs truncate">
+                  {user.email}
+                </span>
+              </div>
+            </div>
+
+            <nav className="space-y-2">
+              <button
+                onClick={() => {
+                  setCurrentScreen("dashboard");
+                  setMenuOpen(false);
+                }}
+                className={`w-full flex items-center gap-3 px-4 py-3 rounded-lg transition-colors ${
+                  currentScreen === "dashboard"
+                    ? "bg-green-500/20 text-green-400"
+                    : "text-gray-300 hover:bg-[#0a1628]"
+                }`}
+              >
+                <Menu className="w-5 h-5" />
+                Dashboard
+              </button>
+
+              <button
+                onClick={() => {
+                  setCurrentScreen("generation");
+                  setMenuOpen(false);
+                }}
+                className={`w-full flex items-center gap-3 px-4 py-3 rounded-lg transition-colors ${
+                  currentScreen === "generation"
+                    ? "bg-green-500/20 text-green-400"
+                    : "text-gray-300 hover:bg-[#0a1628]"
+                }`}
+              >
+                <Sun className="w-5 h-5" />
+                Geração
+              </button>
+
+              <button
+                onClick={() => {
+                  setCurrentScreen("consumption");
+                  setMenuOpen(false);
+                }}
+                className={`w-full flex items-center gap-3 px-4 py-3 rounded-lg transition-colors ${
+                  currentScreen === "consumption"
+                    ? "bg-green-500/20 text-green-400"
+                    : "text-gray-300 hover:bg-[#0a1628]"
+                }`}
+              >
+                <Plug className="w-5 h-5" />
+                Consumo
+              </button>
+
+              <button
+                onClick={() => {
+                  setCurrentScreen("historic");
+                  setMenuOpen(false);
+                }}
+                className={`w-full flex items-center gap-3 px-4 py-3 rounded-lg transition-colors ${
+                  currentScreen === "historic"
+                    ? "bg-green-500/20 text-green-400"
+                    : "text-gray-300 hover:bg-[#0a1628]"
+                }`}
+              >
+                <History className="w-5 h-5" />
+                Histórico
+              </button>
+
+              <button
+                onClick={() => {
+                  setCurrentScreen("monitoring");
+                  setMenuOpen(false);
+                }}
+                className={`w-full flex items-center gap-3 px-4 py-3 rounded-lg transition-colors ${
+                  currentScreen === "monitoring"
+                    ? "bg-green-500/20 text-green-400"
+                    : "text-gray-300 hover:bg-[#0a1628]"
+                }`}
+              >
+                <Users className="w-5 h-5" />
+                Monitoramento
+              </button>
+
+              <button
+                onClick={() => {
+                  setCurrentScreen("settings");
+                  setMenuOpen(false);
+                }}
+                className={`w-full flex items-center gap-3 px-4 py-3 rounded-lg transition-colors ${
+                  currentScreen === "settings"
+                    ? "bg-green-500/20 text-green-400"
+                    : "text-gray-300 hover:bg-[#0a1628]"
+                }`}
+              >
+                <Settings className="w-5 h-5" />
+                Configurações
+              </button>
+            </nav>
+
+            <button
+              onClick={onLogout}
+              className="w-full flex items-center gap-3 px-4 py-3 rounded-lg text-red-400 hover:bg-red-500/10 transition-colors mt-6"
+            >
+              <LogOut className="w-5 h-5" />
+              Sair
+            </button>
+          </div>
         </div>
+      )}
 
-        {/* Info */}
-        <div className="flex flex-col min-w-0">
-          <span className="text-white font-semibold text-sm truncate">
-            {user?.name ? user.name.split(" ")[0] : "Usuário"}
-          </span>
-          <span className="text-gray-400 text-xs truncate">
-            {user.email}
-          </span>
-        </div>
-      </div>
-
-      <nav className="space-y-2">
-        <button
-          onClick={() => {
-            setCurrentScreen("dashboard");
-            setMenuOpen(false);
-          }}
-          className={`w-full flex items-center gap-3 px-4 py-3 rounded-lg transition-colors ${
-            currentScreen === "dashboard"
-              ? "bg-green-500/20 text-green-400"
-              : "text-gray-300 hover:bg-[#0a1628]"
-          }`}
-        >
-          <Menu className="w-5 h-5" />
-          Dashboard
-        </button>
-
-        <button
-          onClick={() => {
-            setCurrentScreen("generation");
-            setMenuOpen(false);
-          }}
-          className={`w-full flex items-center gap-3 px-4 py-3 rounded-lg transition-colors ${
-            currentScreen === "generation"
-              ? "bg-green-500/20 text-green-400"
-              : "text-gray-300 hover:bg-[#0a1628]"
-          }`}
-        >
-          <Sun className="w-5 h-5" />
-          Geração
-        </button>
-
-        <button
-          onClick={() => {
-            setCurrentScreen("consumption");
-            setMenuOpen(false);
-          }}
-          className={`w-full flex items-center gap-3 px-4 py-3 rounded-lg transition-colors ${
-            currentScreen === "consumption"
-              ? "bg-green-500/20 text-green-400"
-              : "text-gray-300 hover:bg-[#0a1628]"
-          }`}
-        >
-          <Plug className="w-5 h-5" />
-          Consumo
-        </button>
-
-        <button
-          onClick={() => {
-            setCurrentScreen("historic");
-            setMenuOpen(false);
-          }}
-          className={`w-full flex items-center gap-3 px-4 py-3 rounded-lg transition-colors ${
-            currentScreen === "historic"
-              ? "bg-green-500/20 text-green-400"
-              : "text-gray-300 hover:bg-[#0a1628]"
-          }`}
-        >
-          <History className="w-5 h-5" />
-          Histórico
-        </button>
-
-        <button
-          onClick={() => {
-            setCurrentScreen("monitoring");
-            setMenuOpen(false);
-          }}
-          className={`w-full flex items-center gap-3 px-4 py-3 rounded-lg transition-colors ${
-            currentScreen === "monitoring"
-              ? "bg-green-500/20 text-green-400"
-              : "text-gray-300 hover:bg-[#0a1628]"
-          }`}
-        >
-          <Users className="w-5 h-5" />
-          Monitoramento
-        </button>
-
-        <button
-          onClick={() => {
-            setCurrentScreen("settings");
-            setMenuOpen(false);
-          }}
-          className={`w-full flex items-center gap-3 px-4 py-3 rounded-lg transition-colors ${
-            currentScreen === "settings"
-              ? "bg-green-500/20 text-green-400"
-              : "text-gray-300 hover:bg-[#0a1628]"
-          }`}
-        >
-          <Settings className="w-5 h-5" />
-          Configurações
-        </button>
-      </nav>
-
-      <button
-        onClick={onLogout}
-        className="w-full flex items-center gap-3 px-4 py-3 rounded-lg text-red-400 hover:bg-red-500/10 transition-colors mt-6"
-      >
-        <LogOut className="w-5 h-5" />
-        Sair
-      </button>
-
-    </div>
-  </div>
-)}
-      
       <main className="p-4">{renderScreen()}</main>
     </div>
   );
