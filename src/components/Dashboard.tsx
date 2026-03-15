@@ -119,19 +119,38 @@ export function Dashboard({ user, onLogout }: DashboardProps) {
     return Math.abs(v) < 0.0005 ? 0 : v;
   }, [monthKwh, monthConsKwh]);
 
-  const DEVICE_GERACAO = "ESP32_PZEM_TESTE";
-
   const [relayState, setRelayState] = useState<boolean | null>(null);
   const [relayLoading, setRelayLoading] = useState(false);
   const [relayError, setRelayError] = useState("");
 
+  const [clienteDeviceGeracao, setClienteDeviceGeracao] = useState<
+    string | null
+  >(null);
+  const [clienteDeviceConsumo, setClienteDeviceConsumo] = useState<
+    string | null
+  >(null);
+
+  const cpfVariants = useMemo(() => {
+    if (!targetCPF) return [];
+    const clean = normalizeCpf(targetCPF);
+    const masked = maskCPF(clean);
+    return Array.from(new Set([clean, masked]));
+  }, [targetCPF]);
+
   const fetchRelayState = async () => {
+    if (!targetCPF) {
+      setRelayState(null);
+      setClienteDeviceGeracao(null);
+      setClienteDeviceConsumo(null);
+      return;
+    }
+
     setRelayError("");
 
     const { data, error } = await supabase
       .from("device_status")
-      .select("relay_state")
-      .eq("device_geracao", DEVICE_GERACAO)
+      .select("relay_state, device_geracao, device_consumo")
+      .eq("cpf", targetCPF)
       .maybeSingle();
 
     if (error) {
@@ -143,14 +162,18 @@ export function Dashboard({ user, onLogout }: DashboardProps) {
 
     if (!data) {
       setRelayState(false);
+      setClienteDeviceGeracao(null);
+      setClienteDeviceConsumo(null);
       return;
     }
 
     setRelayState(!!data.relay_state);
+    setClienteDeviceGeracao(data.device_geracao || null);
+    setClienteDeviceConsumo(data.device_consumo || null);
   };
 
   const toggleSystemPower = async () => {
-    if (relayState === null) return;
+    if (relayState === null || !targetCPF) return;
 
     setRelayLoading(true);
     setRelayError("");
@@ -160,30 +183,56 @@ export function Dashboard({ user, onLogout }: DashboardProps) {
 
     setRelayState(nextState);
 
-    const { error } = await supabase.from("device_status").upsert(
-      {
-        device_geracao: DEVICE_GERACAO,
-        relay_state: nextState,
-        updated_at: new Date().toISOString(),
-      },
-      { onConflict: "device_geracao" },
-    );
+    try {
+      const { data: existingStatus, error: selectError } = await supabase
+        .from("device_status")
+        .select("id, cpf")
+        .eq("cpf", targetCPF)
+        .maybeSingle();
 
-    if (error) {
+      if (selectError) {
+        throw new Error(selectError.message);
+      }
+
+      if (existingStatus) {
+        const { error: updateError } = await supabase
+          .from("device_status")
+          .update({
+            relay_state: nextState,
+            device_geracao: clienteDeviceGeracao || null,
+            device_consumo: clienteDeviceConsumo || null,
+            updated_at: new Date().toISOString(),
+          })
+          .eq("cpf", targetCPF);
+
+        if (updateError) {
+          throw new Error(updateError.message);
+        }
+      } else {
+        const { error: insertError } = await supabase
+          .from("device_status")
+          .insert([
+            {
+              cpf: targetCPF,
+              relay_state: nextState,
+              device_geracao: clienteDeviceGeracao || null,
+              device_consumo: clienteDeviceConsumo || null,
+              updated_at: new Date().toISOString(),
+            },
+          ]);
+
+        if (insertError) {
+          throw new Error(insertError.message);
+        }
+      }
+    } catch (error: any) {
       console.error("❌ Erro toggleSystemPower:", error);
       setRelayError(error.message || "Erro ao atualizar estado do sistema");
       setRelayState(prevState);
+    } finally {
+      setRelayLoading(false);
     }
-
-    setRelayLoading(false);
   };
-
-  const cpfVariants = useMemo(() => {
-    if (!targetCPF) return [];
-    const clean = normalizeCpf(targetCPF);
-    const masked = maskCPF(clean);
-    return Array.from(new Set([clean, masked]));
-  }, [targetCPF]);
 
   const fetchLatestData = async () => {
     if (!targetCPF) return;
@@ -345,7 +394,7 @@ export function Dashboard({ user, onLogout }: DashboardProps) {
 
     const { data, error } = await supabase
       .from("clientes")
-      .select("name")
+      .select("name, device_geracao, device_consumo")
       .eq("cpf", targetCPF)
       .limit(1);
 
@@ -366,11 +415,15 @@ export function Dashboard({ user, onLogout }: DashboardProps) {
     if (!data || data.length === 0) {
       setPersonName("");
       setNameNotFound(true);
+      setClienteDeviceGeracao(null);
+      setClienteDeviceConsumo(null);
       setLoadingName(false);
       return;
     }
 
     setPersonName(data[0]?.name || "");
+    setClienteDeviceGeracao(data[0]?.device_geracao || null);
+    setClienteDeviceConsumo(data[0]?.device_consumo || null);
     setNameNotFound(false);
     setLoadingName(false);
   };
@@ -502,17 +555,19 @@ export function Dashboard({ user, onLogout }: DashboardProps) {
         .subscribe();
 
       relaySub = supabase
-        .channel(`realtime-device-status-${DEVICE_GERACAO}`)
+        .channel(`realtime-device-status-${targetCPF}`)
         .on(
           "postgres_changes",
           {
             event: "*",
             schema: "public",
             table: "device_status",
-            filter: `device_geracao=eq.${DEVICE_GERACAO}`,
+            filter: `cpf=eq.${targetCPF}`,
           },
           (payload: any) => {
-            setRelayState(!!payload.new.relay_state);
+            setRelayState(!!payload.new?.relay_state);
+            setClienteDeviceGeracao(payload.new?.device_geracao || null);
+            setClienteDeviceConsumo(payload.new?.device_consumo || null);
             setRelayError("");
           },
         )
@@ -542,6 +597,8 @@ export function Dashboard({ user, onLogout }: DashboardProps) {
       setRelayState(null);
       setRelayError("");
       setRelayLoading(false);
+      setClienteDeviceGeracao(null);
+      setClienteDeviceConsumo(null);
     }
 
     return () => {

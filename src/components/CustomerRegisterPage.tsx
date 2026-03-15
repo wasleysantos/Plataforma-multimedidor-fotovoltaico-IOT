@@ -6,7 +6,6 @@ interface CustomerRegisterPageProps {
   onBack?: () => void;
 }
 
-// ✅ helpers
 function onlyDigits(v: string) {
   return (v || "").replace(/\D/g, "");
 }
@@ -32,20 +31,17 @@ function formatCep(v: string) {
   return part2 ? `${part1}-${part2}` : part1;
 }
 
-// ✅ máscara WhatsApp BR para exibição (DDD + número)
 function formatWhatsappBR(v: string) {
   let d = onlyDigits(v);
   if (d.startsWith("55")) d = d.slice(2);
 
-  d = d.slice(0, 11); // DDD + 8/9 dígitos
+  d = d.slice(0, 11);
   const ddd = d.slice(0, 2);
   const rest = d.slice(2);
 
   if (!ddd) return "";
 
-  // 11 dígitos => celular; 10 dígitos => fixo
   const isCell = d.length >= 11;
-
   const p1 = isCell ? rest.slice(0, 5) : rest.slice(0, 4);
   const p2 = isCell ? rest.slice(5, 9) : rest.slice(4, 8);
 
@@ -55,20 +51,13 @@ function formatWhatsappBR(v: string) {
   return `(${ddd}) ${p1}-${p2}`;
 }
 
-// ✅ converte para E.164 BR: +55 + DDD + número (10/11 dígitos após DDD)
 function whatsappToE164BR(input: string) {
   let d = onlyDigits(input);
-
-  // se vier com 55, remove para validar como "local"
   if (d.startsWith("55")) d = d.slice(2);
-
-  // Agora esperamos 10 ou 11 dígitos (DDD + número)
   if (!(d.length === 10 || d.length === 11)) return null;
-
   return `+55${d}`;
 }
 
-// ✅ CPF válido
 function isValidCPF(cpf: string) {
   const clean = onlyDigits(cpf);
   if (clean.length !== 11) return false;
@@ -93,11 +82,9 @@ export function CustomerRegisterPage({ onBack }: CustomerRegisterPageProps) {
   const [newName, setNewName] = useState("");
   const [newCpf, setNewCpf] = useState("");
   const [newEmail, setNewEmail] = useState("");
-
-  // ✅ NOVOS CAMPOS
   const [newWhatsapp, setNewWhatsapp] = useState("");
   const [newDeviceGeracao, setNewDeviceGeracao] = useState("");
-
+  const [newDeviceConsumo, setNewDeviceConsumo] = useState("");
   const [newAddress, setNewAddress] = useState("");
   const [newZip, setNewZip] = useState("");
   const [newState, setNewState] = useState("");
@@ -109,7 +96,19 @@ export function CustomerRegisterPage({ onBack }: CustomerRegisterPageProps) {
     msg: string;
   } | null>(null);
 
-  // Auto-preencher Endereço/Cidade/UF via CEP (viaCEP)
+  const resetForm = () => {
+    setNewName("");
+    setNewCpf("");
+    setNewEmail("");
+    setNewWhatsapp("");
+    setNewDeviceGeracao("");
+    setNewDeviceConsumo("");
+    setNewAddress("");
+    setNewZip("");
+    setNewState("");
+    setNewCity("");
+  };
+
   const fetchAddressByCep = async (zipRaw: string) => {
     const zip = (zipRaw || "").replace(/\D/g, "");
     if (zip.length !== 8) return;
@@ -125,8 +124,13 @@ export function CustomerRegisterPage({ onBack }: CustomerRegisterPageProps) {
         setNewCity(data.localidade || "");
         setNewState((data.uf || "").toUpperCase());
 
-        const sugerido = [logradouro, bairro].filter(Boolean).join(" - ");
-        if (!newAddress.trim() && sugerido) setNewAddress(sugerido);
+        const suggestedAddress = [logradouro, bairro]
+          .filter(Boolean)
+          .join(" - ");
+
+        if (!newAddress.trim() && suggestedAddress) {
+          setNewAddress(suggestedAddress);
+        }
       }
     } catch (err) {
       console.error("Erro ao buscar CEP:", err);
@@ -138,105 +142,101 @@ export function CustomerRegisterPage({ onBack }: CustomerRegisterPageProps) {
     setStatus(null);
     setLoading(true);
 
-    const cpfDigits = onlyDigits(newCpf);
+    try {
+      const cpfDigits = onlyDigits(newCpf);
 
-    if (!isValidCPF(cpfDigits)) {
-      setStatus({ type: "error", msg: "CPF inválido. Verifique os dígitos." });
-      setLoading(false);
-      return;
-    }
-
-    // ✅ whatsapp: salva como +55XXXXXXXXXXX
-    const whatsappE164 = newWhatsapp.trim()
-      ? whatsappToE164BR(newWhatsapp)
-      : null;
-
-    if (newWhatsapp.trim() && !whatsappE164) {
-      setStatus({
-        type: "error",
-        msg: "WhatsApp inválido. Use DDD + número (ex: (98) 98888-7777).",
-      });
-      setLoading(false);
-      return;
-    }
-
-    // ✅ device_geracao: uppercase + sem espaços
-    const deviceGeracaoClean = (newDeviceGeracao || "")
-      .trim()
-      .toUpperCase()
-      .replace(/\s+/g, "");
-
-    // ✅ 1) payload do cliente (clientes)
-    const clientePayload: any = {
-      name: newName.trim(),
-      cpf: cpfDigits,
-      email: newEmail.trim() || null,
-
-      whatsapp: whatsappE164, // ✅ SALVO COM +55
-      device_geracao: deviceGeracaoClean || null, // ✅ AGORA É device_geracao
-
-      address: newAddress.trim() || null,
-      zip_code: newZip.trim() || null,
-      state: newState.trim().toUpperCase() || null,
-      city: newCity.trim() || null,
-    };
-
-    // ✅ salva/atualiza cliente
-    const { error: cErr } = await supabase
-      .from("clientes") // ✅ customers -> clientes
-      .upsert([clientePayload], { onConflict: "cpf" });
-
-    if (cErr) {
-      setStatus({
-        type: "error",
-        msg: `Erro ao salvar cliente: ${
-          cErr.message || "verifique colunas/constraint no Supabase"
-        }`,
-      });
-      setLoading(false);
-      return;
-    }
-
-    // ✅ 2) vincula em clientes_devices (cpf + device_geracao)
-    if (deviceGeracaoClean) {
-      const devicePayload: any = {
-        cpf: cpfDigits,
-        device_geracao: deviceGeracaoClean, // ✅ mudou aqui
-        nickname: null,
-      };
-
-      const { error: dErr } = await supabase
-        .from("clientes_devices") // ✅ customers_devices -> clientes_devices
-        .upsert([devicePayload], { onConflict: "cpf,device_geracao" }); // ✅ mudou aqui
-
-      if (dErr) {
+      if (!isValidCPF(cpfDigits)) {
         setStatus({
           type: "error",
-          msg: `Cliente salvo, mas erro ao vincular dispositivo: ${dErr.message}`,
+          msg: "CPF inválido. Verifique os dígitos.",
         });
-        setLoading(false);
         return;
       }
+
+      const whatsappE164 = newWhatsapp.trim()
+        ? whatsappToE164BR(newWhatsapp)
+        : null;
+
+      if (newWhatsapp.trim() && !whatsappE164) {
+        setStatus({
+          type: "error",
+          msg: "WhatsApp inválido. Use DDD + número.",
+        });
+        return;
+      }
+
+      const deviceGeracaoClean = (newDeviceGeracao || "")
+        .trim()
+        .toUpperCase()
+        .replace(/\s+/g, "");
+
+      const deviceConsumoClean = (newDeviceConsumo || "")
+        .trim()
+        .toUpperCase()
+        .replace(/\s+/g, "");
+
+      const clientePayload = {
+        name: newName.trim(),
+        cpf: cpfDigits,
+        email: newEmail.trim() || null,
+        whatsapp: whatsappE164,
+        device_geracao: deviceGeracaoClean || null,
+        device_consumo: deviceConsumoClean || null,
+        address: newAddress.trim() || null,
+        zip_code: newZip.trim() || null,
+        state: newState.trim().toUpperCase() || null,
+        city: newCity.trim() || null,
+      };
+
+      const { data: clienteExistente, error: clienteSelectError } =
+        await supabase
+          .from("clientes")
+          .select("id, cpf")
+          .eq("cpf", cpfDigits)
+          .maybeSingle();
+
+      if (clienteSelectError) {
+        throw new Error(`Erro ao consultar cliente: ${clienteSelectError.message}`);
+      }
+
+      if (clienteExistente) {
+        const { error: clienteUpdateError } = await supabase
+          .from("clientes")
+          .update(clientePayload)
+          .eq("cpf", cpfDigits);
+
+        if (clienteUpdateError) {
+          throw new Error(`Erro ao atualizar cliente: ${clienteUpdateError.message}`);
+        }
+
+        setStatus({
+          type: "success",
+          msg: "Cliente atualizado com sucesso!",
+        });
+      } else {
+        const { error: clienteInsertError } = await supabase
+          .from("clientes")
+          .insert([clientePayload]);
+
+        if (clienteInsertError) {
+          throw new Error(`Erro ao inserir cliente: ${clienteInsertError.message}`);
+        }
+
+        setStatus({
+          type: "success",
+          msg: "Cliente cadastrado com sucesso!",
+        });
+      }
+
+      resetForm();
+    } catch (err: any) {
+      setStatus({
+        type: "error",
+        msg: err?.message || "Erro ao cadastrar cliente.",
+      });
+    } finally {
+      setLoading(false);
     }
-
-    setStatus({
-      type: "success",
-      msg: deviceGeracaoClean
-        ? "Cliente cadastrado/atualizado e device de geração vinculado com sucesso!"
-        : "Cliente cadastrado/atualizado com sucesso!",
-    });
-
-    setNewName("");
-    setNewCpf("");
-    setNewEmail("");
-    setNewWhatsapp("");
-    setNewDeviceGeracao("");
-    setNewAddress("");
-    setNewZip("");
-    setNewCity("");
-    setNewState("");
-
-    setLoading(false);
   };
 
   const whatsappPreview = newWhatsapp.trim()
@@ -245,7 +245,6 @@ export function CustomerRegisterPage({ onBack }: CustomerRegisterPageProps) {
 
   return (
     <div className="space-y-6 pb-24 max-w-3xl mx-auto">
-      {/* Header */}
       <div className="flex items-center justify-between gap-3">
         <div>
           <h2 className="text-2xl font-bold text-white leading-tight">
@@ -266,7 +265,6 @@ export function CustomerRegisterPage({ onBack }: CustomerRegisterPageProps) {
         </button>
       </div>
 
-      {/* Card Cadastro */}
       <div className="bg-[#1a2942] rounded-2xl border border-green-500/20 overflow-hidden">
         <div className="p-6 border-b border-gray-800/60">
           <h3 className="text-white font-semibold flex items-center gap-2">
@@ -276,7 +274,6 @@ export function CustomerRegisterPage({ onBack }: CustomerRegisterPageProps) {
         </div>
 
         <form onSubmit={handleRegister} className="p-4 sm:p-6 space-y-4">
-          {/* Nome */}
           <div className="space-y-1">
             <label className="text-xs text-gray-400">Nome completo</label>
             <input
@@ -288,7 +285,6 @@ export function CustomerRegisterPage({ onBack }: CustomerRegisterPageProps) {
             />
           </div>
 
-          {/* CPF + Email */}
           <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
             <div className="space-y-1">
               <label className="text-xs text-gray-400">CPF</label>
@@ -315,7 +311,6 @@ export function CustomerRegisterPage({ onBack }: CustomerRegisterPageProps) {
             </div>
           </div>
 
-          {/* WhatsApp + Device Geração */}
           <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
             <div className="space-y-1">
               <label className="text-xs text-gray-400">WhatsApp</label>
@@ -329,7 +324,6 @@ export function CustomerRegisterPage({ onBack }: CustomerRegisterPageProps) {
                 inputMode="tel"
                 maxLength={16}
               />
-
               {whatsappPreview && (
                 <div className="text-[10px] text-gray-500 mt-1">
                   Será salvo como:{" "}
@@ -351,7 +345,18 @@ export function CustomerRegisterPage({ onBack }: CustomerRegisterPageProps) {
             </div>
           </div>
 
-          {/* Endereço */}
+          <div className="space-y-1">
+            <label className="text-xs text-gray-400">
+              Device de Consumo (S/N)
+            </label>
+            <input
+              className="w-full bg-[#0a1628] border border-gray-700 rounded-xl px-3 py-3 text-white text-sm outline-none focus:border-green-500 uppercase tracking-wide"
+              placeholder="Ex: 24BRCON00018473"
+              value={newDeviceConsumo}
+              onChange={(e) => setNewDeviceConsumo(e.target.value)}
+            />
+          </div>
+
           <div className="space-y-1">
             <label className="text-xs text-gray-400">Endereço</label>
             <input
@@ -362,7 +367,6 @@ export function CustomerRegisterPage({ onBack }: CustomerRegisterPageProps) {
             />
           </div>
 
-          {/* CEP + UF */}
           <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
             <div className="sm:col-span-2 space-y-1">
               <label className="text-xs text-gray-400">CEP</label>
@@ -393,7 +397,6 @@ export function CustomerRegisterPage({ onBack }: CustomerRegisterPageProps) {
             </div>
           </div>
 
-          {/* Cidade */}
           <div className="space-y-1">
             <label className="text-xs text-gray-400">Cidade</label>
             <input
@@ -404,7 +407,6 @@ export function CustomerRegisterPage({ onBack }: CustomerRegisterPageProps) {
             />
           </div>
 
-          {/* Botão + status */}
           <div className="pt-2 space-y-3">
             <div className="flex justify-end">
               <button
