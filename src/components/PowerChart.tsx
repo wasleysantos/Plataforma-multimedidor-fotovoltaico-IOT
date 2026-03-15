@@ -13,17 +13,17 @@ import { supabase } from "../lib/supabase";
 type GenRow = {
   id: number;
   created_at: string;
-  active_power: any; // potência (W ou kW, depende do seu banco)
+  active_power: any; // potência em W
 };
 
 type ConsRow = {
   id: number;
   created_at: string;
-  active_power: any; // potência (W ou kW, depende do seu banco)
+  active_power: any; // potência em W
 };
 
-type RangeKey = "24h" | "7d" | "30d";
-type Mode = "KW" | "BRL_ECON";
+type RangeKey = "24h" | "30d";
+type Mode = "W" | "BRL_ECON";
 
 function toNum(v: any) {
   const n = Number(v);
@@ -32,7 +32,6 @@ function toNum(v: any) {
 
 function hoursForRange(r: RangeKey) {
   if (r === "24h") return 24;
-  if (r === "7d") return 24 * 7;
   return 24 * 30;
 }
 
@@ -83,7 +82,6 @@ function fmtTooltip(ts: string) {
   }).format(d);
 }
 
-// ===== CPF variants (limpo + mascarado) =====
 const normalizeCpf = (value: string) =>
   (value || "").replace(/\D/g, "").slice(0, 11);
 
@@ -101,10 +99,9 @@ const maskCPF = (value: string) => {
   return out;
 };
 
-type Point = { ts: string; genKw: number; consKw: number };
+type Point = { ts: string; genW: number; consW: number };
 
 function buildSeries(points: Point[], tarifa: number) {
-  // economia acumulada baseada apenas em geração (mantém seu comportamento)
   let kwhAcum = 0;
 
   return points.map((p, i) => {
@@ -112,8 +109,8 @@ function buildSeries(points: Point[], tarifa: number) {
       return {
         ts: p.ts,
         label: "",
-        gen_kw: p.genKw,
-        cons_kw: p.consKw,
+        gen_w: p.genW,
+        cons_w: p.consW,
         brl_econ: 0,
       };
     }
@@ -122,23 +119,25 @@ function buildSeries(points: Point[], tarifa: number) {
     const t1 = tsToMs(p.ts);
     const dtHours = Math.max(0, (t1 - t0) / (1000 * 60 * 60));
 
-    const g0 = points[i - 1].genKw;
-    const g1 = p.genKw;
+    // converte W -> kW só para calcular kWh
+    const g0kw = points[i - 1].genW / 1000;
+    const g1kw = p.genW / 1000;
 
-    const incKwh = ((g0 + g1) / 2) * dtHours;
+    const incKwh = ((g0kw + g1kw) / 2) * dtHours;
     kwhAcum += incKwh;
 
     return {
       ts: p.ts,
       label: "",
-      gen_kw: p.genKw,
-      cons_kw: p.consKw,
+      gen_w: p.genW,
+      cons_w: p.consW,
       brl_econ: Number((kwhAcum * tarifa).toFixed(2)),
     };
   });
 }
 
-const FALLBACK_TARIFA_MA = 0.85;
+// ✅ tarifa fixa
+const FIXED_TARIFA = 1.12;
 
 export function PowerChart({ cpf }: { cpf: string }) {
   const [genRows, setGenRows] = useState<GenRow[]>([]);
@@ -146,12 +145,9 @@ export function PowerChart({ cpf }: { cpf: string }) {
   const [loading, setLoading] = useState(false);
   const [dbError, setDbError] = useState("");
 
-  const [range, setRange] = useState<RangeKey>("24h");
-  const [mode, setMode] = useState<Mode>("KW");
-
-  const [tarifaKwh, setTarifaKwh] = useState<number>(FALLBACK_TARIFA_MA);
-  const [tarifaLoading, setTarifaLoading] = useState(false);
-  const [tarifaError, setTarifaError] = useState("");
+  // ✅ padrão = 30 dias
+  const [range, setRange] = useState<RangeKey>("30d");
+  const [mode, setMode] = useState<Mode>("W");
 
   const rangeRef = useRef(range);
   useEffect(() => {
@@ -165,45 +161,6 @@ export function PowerChart({ cpf }: { cpf: string }) {
     return Array.from(new Set([clean, masked]));
   }, [cpf]);
 
-  // Tarifa
-  useEffect(() => {
-    const fetchTarifa = async () => {
-      if (!cpf) {
-        setTarifaKwh(FALLBACK_TARIFA_MA);
-        setTarifaError("");
-        setTarifaLoading(false);
-        return;
-      }
-
-      setTarifaLoading(true);
-      setTarifaError("");
-
-      const clean = normalizeCpf(cpf);
-
-      const { data, error } = await supabase
-        .from("clientes")
-        .select("tarifa_kwh")
-        .eq("cpf", clean)
-        .maybeSingle();
-
-      if (error) {
-        setTarifaKwh(FALLBACK_TARIFA_MA);
-        setTarifaError(error.message || "Erro ao buscar tarifa");
-        setTarifaLoading(false);
-        return;
-      }
-
-      const t = Number(data?.tarifa_kwh);
-      const ok = Number.isFinite(t) && t > 0;
-
-      setTarifaKwh(ok ? t : FALLBACK_TARIFA_MA);
-      setTarifaLoading(false);
-    };
-
-    fetchTarifa();
-  }, [cpf]);
-
-  // Fetch gráfico (GERAÇÃO + CONSUMO)
   useEffect(() => {
     const fetchChart = async () => {
       if (!cpf) {
@@ -257,7 +214,6 @@ export function PowerChart({ cpf }: { cpf: string }) {
     fetchChart();
   }, [cpf, range, cpfVariants]);
 
-  // Realtime: channels para CPF limpo e mascarado (se forem diferentes)
   useEffect(() => {
     if (!cpf) return;
 
@@ -328,7 +284,6 @@ export function PowerChart({ cpf }: { cpf: string }) {
     };
   }, [cpf, cpfVariants]);
 
-  // Monta dados do gráfico (merge por timestamp + forward-fill)
   const chartData = useMemo(() => {
     const g = [...(genRows || [])]
       .filter((r) => Number.isFinite(tsToMs(r.created_at)))
@@ -364,16 +319,16 @@ export function PowerChart({ cpf }: { cpf: string }) {
     const points: Point[] = merged.map((m) => {
       if (typeof m.gen === "number") lastGen = m.gen;
       if (typeof m.cons === "number") lastCons = m.cons;
-      return { ts: m.ts, genKw: lastGen, consKw: lastCons };
+      return { ts: m.ts, genW: lastGen, consW: lastCons };
     });
 
-    const series = buildSeries(points, tarifaKwh || 0);
+    const series = buildSeries(points, FIXED_TARIFA);
 
     return series.map((s) => ({
       ...s,
       label: fmtAxis(s.ts, range),
     }));
-  }, [genRows, consRows, tarifaKwh, range]);
+  }, [genRows, consRows, range]);
 
   const ZoomButton = ({ k, label }: { k: RangeKey; label: string }) => (
     <button
@@ -428,14 +383,12 @@ export function PowerChart({ cpf }: { cpf: string }) {
   }
 
   if (chartData.length === 0) {
-    const label =
-      range === "24h" ? "24 horas" : range === "7d" ? "7 dias" : "30 dias";
+    const label = range === "24h" ? "24 horas" : "30 dias";
     return (
       <div className="h-20 flex flex-col gap-2 items-center justify-center text-gray-600 text-xs">
         <div>Sem dados nas últimas {label}.</div>
         <div className="flex gap-2">
           <ZoomButton k="24h" label="24h" />
-          <ZoomButton k="7d" label="7d" />
           <ZoomButton k="30d" label="30d" />
         </div>
       </div>
@@ -445,7 +398,7 @@ export function PowerChart({ cpf }: { cpf: string }) {
   const yTick = (value: any) =>
     mode === "BRL_ECON"
       ? `R$ ${Number(value).toFixed(0)}`
-      : Number(value).toFixed(1);
+      : `${Number(value).toFixed(0)} W`;
 
   return (
     <div className="w-full">
@@ -454,48 +407,39 @@ export function PowerChart({ cpf }: { cpf: string }) {
           <span className="ml-3">
             Tarifa Média Equatorial Maranhão:{" "}
             <span className="text-gray-200 font-semibold">
-              {tarifaLoading
-                ? "Carregando..."
-                : `R$ ${tarifaKwh.toFixed(2)}/kWh`}
+              R$ {FIXED_TARIFA.toFixed(2)}/kWh
             </span>
           </span>
         </div>
 
         <div className="flex gap-2">
           <ZoomButton k="24h" label="24h" />
-          <ZoomButton k="7d" label="7d" />
           <ZoomButton k="30d" label="30d" />
         </div>
       </div>
 
       <div className="flex items-center justify-between mb-2 gap-3">
         <div className="flex gap-2">
-          <ModeButton m="KW" label="kW" />
+          <ModeButton m="W" label="W" />
           <ModeButton m="BRL_ECON" label="Economia em R$" />
         </div>
 
         <div className="text-[11px] text-gray-500 text-right">
           Período:{" "}
           <span className="text-gray-200 font-semibold">
-            {range === "24h" ? "24h" : range === "7d" ? "7 dias" : "30 dias"}
+            {range === "24h" ? "24h" : "30 dias"}
           </span>
         </div>
       </div>
 
-      {tarifaError && (
-        <div className="text-[11px] text-yellow-400 mb-2">{tarifaError}</div>
-      )}
-
       <ResponsiveContainer width="100%" height={220}>
         <AreaChart data={chartData}>
           <defs>
-            {/* Geração */}
             <linearGradient id="genGradient" x1="0" y1="0" x2="0" y2="1">
               <stop offset="5%" stopColor="#22c55e" stopOpacity={0.8} />
               <stop offset="95%" stopColor="#22c55e" stopOpacity={0.1} />
             </linearGradient>
 
-            {/* Consumo */}
             <linearGradient id="consGradient" x1="0" y1="0" x2="0" y2="1">
               <stop offset="5%" stopColor="#f59e0b" stopOpacity={0.7} />
               <stop offset="95%" stopColor="#f59e0b" stopOpacity={0.08} />
@@ -525,9 +469,10 @@ export function PowerChart({ cpf }: { cpf: string }) {
                 : "Atualizado em: --";
             }}
             formatter={(value: any, name: string) => {
-              if (mode === "BRL_ECON")
+              if (mode === "BRL_ECON") {
                 return [`R$ ${Number(value).toFixed(2)}`, name];
-              return [`${Number(value).toFixed(2)} kW`, name];
+              }
+              return [`${Number(value).toFixed(0)} W`, name];
             }}
             contentStyle={{
               backgroundColor: "#1a2942",
@@ -556,8 +501,8 @@ export function PowerChart({ cpf }: { cpf: string }) {
             <>
               <Area
                 type="monotone"
-                dataKey="gen_kw"
-                name="Geração (kW)"
+                dataKey="gen_w"
+                name="Geração (W)"
                 stroke="#22c55e"
                 strokeWidth={2}
                 fillOpacity={1}
@@ -566,8 +511,8 @@ export function PowerChart({ cpf }: { cpf: string }) {
 
               <Area
                 type="monotone"
-                dataKey="cons_kw"
-                name="Consumo (kW)"
+                dataKey="cons_w"
+                name="Consumo (W)"
                 stroke="#f59e0b"
                 strokeWidth={2}
                 fillOpacity={1}
