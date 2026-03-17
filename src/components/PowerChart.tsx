@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   AreaChart,
   Area,
@@ -13,17 +13,16 @@ import { supabase } from "../lib/supabase";
 type GenRow = {
   id: number;
   created_at: string;
-  active_power: any; // potência em W
+  active_power: any;
 };
 
 type ConsRow = {
   id: number;
   created_at: string;
-  active_power: any; // potência em W
+  active_power: any;
 };
 
 type RangeKey = "24h" | "30d";
-type Mode = "W" | "BRL_ECON";
 
 function toNum(v: any) {
   const n = Number(v);
@@ -31,8 +30,7 @@ function toNum(v: any) {
 }
 
 function hoursForRange(r: RangeKey) {
-  if (r === "24h") return 24;
-  return 24 * 30;
+  return r === "24h" ? 24 : 24 * 30;
 }
 
 function tsToMs(ts: string) {
@@ -43,13 +41,6 @@ function tsToMs(ts: string) {
 function sinceIso(range: RangeKey) {
   const h = hoursForRange(range);
   return new Date(Date.now() - h * 60 * 60 * 1000).toISOString();
-}
-
-function inWindow(ts: string, range: RangeKey) {
-  const ms = tsToMs(ts);
-  if (!Number.isFinite(ms)) return false;
-  const cutoff = Date.now() - hoursForRange(range) * 60 * 60 * 1000;
-  return ms >= cutoff;
 }
 
 function fmtAxis(ts: string, range: RangeKey) {
@@ -72,6 +63,7 @@ function fmtAxis(ts: string, range: RangeKey) {
 function fmtTooltip(ts: string) {
   const d = new Date(ts);
   if (Number.isNaN(d.getTime())) return "Data inválida";
+
   return new Intl.DateTimeFormat("pt-BR", {
     day: "2-digit",
     month: "2-digit",
@@ -99,55 +91,14 @@ const maskCPF = (value: string) => {
   return out;
 };
 
-type Point = { ts: string; genW: number; consW: number };
-
-function buildSeries(points: Point[], tarifa: number) {
-  let kwhAcum = 0;
-
-  return points.map((p, i) => {
-    if (i === 0) {
-      return {
-        ts: p.ts,
-        label: "",
-        gen_w: p.genW,
-        cons_w: p.consW,
-        brl_econ: 0,
-      };
-    }
-
-    const t0 = tsToMs(points[i - 1].ts);
-    const t1 = tsToMs(p.ts);
-    const dtHours = Math.max(0, (t1 - t0) / (1000 * 60 * 60));
-
-    // converte W -> kW só para calcular kWh
-    const g0kw = points[i - 1].genW / 1000;
-    const g1kw = p.genW / 1000;
-
-    const incKwh = ((g0kw + g1kw) / 2) * dtHours;
-    kwhAcum += incKwh;
-
-    return {
-      ts: p.ts,
-      label: "",
-      gen_w: p.genW,
-      cons_w: p.consW,
-      brl_econ: Number((kwhAcum * tarifa).toFixed(2)),
-    };
-  });
-}
-
-// ✅ tarifa fixa
-const FIXED_TARIFA = 1.12;
-
 export function PowerChart({ cpf }: { cpf: string }) {
   const [genRows, setGenRows] = useState<GenRow[]>([]);
   const [consRows, setConsRows] = useState<ConsRow[]>([]);
   const [loading, setLoading] = useState(false);
   const [dbError, setDbError] = useState("");
 
-  // ✅ padrão = 30 dias
+  // padrão 30 dias
   const [range, setRange] = useState<RangeKey>("30d");
-  const [mode, setMode] = useState<Mode>("W");
 
   const rangeRef = useRef(range);
   useEffect(() => {
@@ -161,68 +112,68 @@ export function PowerChart({ cpf }: { cpf: string }) {
     return Array.from(new Set([clean, masked]));
   }, [cpf]);
 
-  useEffect(() => {
-    const fetchChart = async () => {
-      if (!cpf) {
-        setGenRows([]);
-        setConsRows([]);
-        setDbError("");
-        setLoading(false);
-        return;
-      }
-
-      setLoading(true);
+  const fetchChart = useCallback(async () => {
+    if (!cpf) {
+      setGenRows([]);
+      setConsRows([]);
       setDbError("");
-
-      const since = sinceIso(range);
-      const variants = cpfVariants.length ? cpfVariants : [cpf];
-
-      const [genRes, consRes] = await Promise.all([
-        supabase
-          .from("geracao")
-          .select("id,created_at,active_power")
-          .in("user_cpf", variants)
-          .gte("created_at", since)
-          .order("created_at", { ascending: true }),
-
-        supabase
-          .from("consumo")
-          .select("id,created_at,active_power")
-          .in("user_cpf", variants)
-          .gte("created_at", since)
-          .order("created_at", { ascending: true }),
-      ]);
-
-      if (genRes.error || consRes.error) {
-        console.error("PowerChart error:", genRes.error || consRes.error);
-        setDbError(
-          genRes.error?.message ||
-            consRes.error?.message ||
-            "Erro ao consultar geracao/consumo",
-        );
-        setGenRows([]);
-        setConsRows([]);
-        setLoading(false);
-        return;
-      }
-
-      setGenRows((genRes.data as GenRow[]) || []);
-      setConsRows((consRes.data as ConsRow[]) || []);
       setLoading(false);
-    };
+      return;
+    }
 
+    setLoading(true);
+    setDbError("");
+
+    const since = sinceIso(rangeRef.current);
+    const variants = cpfVariants.length ? cpfVariants : [cpf];
+
+    const [genRes, consRes] = await Promise.all([
+      supabase
+        .from("geracao")
+        .select("id,created_at,active_power")
+        .in("user_cpf", variants)
+        .gte("created_at", since)
+        .order("created_at", { ascending: true }),
+
+      supabase
+        .from("consumo")
+        .select("id,created_at,active_power")
+        .in("user_cpf", variants)
+        .gte("created_at", since)
+        .order("created_at", { ascending: true }),
+    ]);
+
+    if (genRes.error || consRes.error) {
+      console.error("PowerChart error:", genRes.error || consRes.error);
+      setDbError(
+        genRes.error?.message ||
+          consRes.error?.message ||
+          "Erro ao consultar geracao/consumo",
+      );
+      setGenRows([]);
+      setConsRows([]);
+      setLoading(false);
+      return;
+    }
+
+    setGenRows((genRes.data as GenRow[]) || []);
+    setConsRows((consRes.data as ConsRow[]) || []);
+    setLoading(false);
+  }, [cpf, cpfVariants]);
+
+  useEffect(() => {
     fetchChart();
-  }, [cpf, range, cpfVariants]);
+  }, [fetchChart, range]);
 
   useEffect(() => {
     if (!cpf) return;
 
-    const variants = cpfVariants.length ? cpfVariants : [cpf];
     const channels: any[] = [];
+    const variants = cpfVariants.length ? cpfVariants : [cpf];
 
-    const subTable = (table: "geracao" | "consumo", userCpf: string) => {
-      const ch = supabase
-        .channel(`realtime-powerchart-${table}-${userCpf}`)
+    const subscribeTable = (table: "geracao" | "consumo", userCpf: string) => {
+      const channel = supabase
+        .channel(`realtime-${table}-${userCpf}-${rangeRef.current}`)
         .on(
           "postgres_changes",
           {
@@ -231,58 +182,26 @@ export function PowerChart({ cpf }: { cpf: string }) {
             table,
             filter: `user_cpf=eq.${userCpf}`,
           },
-          (payload: any) => {
-            const r = payload?.new;
-            if (!r?.id || !r?.created_at) return;
-
-            const currentRange = rangeRef.current;
-
-            if (!inWindow(r.created_at, currentRange)) {
-              if (table === "geracao") {
-                setGenRows((prev) => prev.filter((x) => x.id !== r.id));
-              } else {
-                setConsRows((prev) => prev.filter((x) => x.id !== r.id));
-              }
-              return;
-            }
-
-            const upsert = <T extends { id: number; created_at: string }>(
-              prev: T[],
-            ) => {
-              const map = new Map<number, T>();
-              for (const x of prev) map.set(x.id, x);
-              map.set(r.id, r as T);
-
-              const ordered = Array.from(map.values())
-                .filter((x) => Number.isFinite(tsToMs(x.created_at)))
-                .sort((a, b) => tsToMs(a.created_at) - tsToMs(b.created_at));
-
-              const cutoff =
-                Date.now() - hoursForRange(currentRange) * 60 * 60 * 1000;
-
-              return ordered.filter((x) => tsToMs(x.created_at) >= cutoff);
-            };
-
-            if (table === "geracao") setGenRows((prev) => upsert(prev));
-            else setConsRows((prev) => upsert(prev));
-
-            setDbError("");
+          async () => {
+            await fetchChart();
           },
         )
         .subscribe();
 
-      channels.push(ch);
+      channels.push(channel);
     };
 
     for (const v of variants) {
-      subTable("geracao", v);
-      subTable("consumo", v);
+      subscribeTable("geracao", v);
+      subscribeTable("consumo", v);
     }
 
     return () => {
-      for (const ch of channels) supabase.removeChannel(ch);
+      for (const ch of channels) {
+        supabase.removeChannel(ch);
+      }
     };
-  }, [cpf, cpfVariants]);
+  }, [cpf, cpfVariants, fetchChart]);
 
   const chartData = useMemo(() => {
     const g = [...(genRows || [])]
@@ -304,10 +223,14 @@ export function PowerChart({ cpf }: { cpf: string }) {
     if (g.length === 0 && c.length === 0) return [];
 
     const map = new Map<string, { ts: string; gen?: number; cons?: number }>();
-    for (const x of g)
+
+    for (const x of g) {
       map.set(x.ts, { ...(map.get(x.ts) || { ts: x.ts }), gen: x.gen });
-    for (const x of c)
+    }
+
+    for (const x of c) {
       map.set(x.ts, { ...(map.get(x.ts) || { ts: x.ts }), cons: x.cons });
+    }
 
     const merged = Array.from(map.values()).sort(
       (a, b) => tsToMs(a.ts) - tsToMs(b.ts),
@@ -316,18 +239,17 @@ export function PowerChart({ cpf }: { cpf: string }) {
     let lastGen = 0;
     let lastCons = 0;
 
-    const points: Point[] = merged.map((m) => {
+    return merged.map((m) => {
       if (typeof m.gen === "number") lastGen = m.gen;
       if (typeof m.cons === "number") lastCons = m.cons;
-      return { ts: m.ts, genW: lastGen, consW: lastCons };
+
+      return {
+        ts: m.ts,
+        label: fmtAxis(m.ts, range),
+        gen_w: lastGen,
+        cons_w: lastCons,
+      };
     });
-
-    const series = buildSeries(points, FIXED_TARIFA);
-
-    return series.map((s) => ({
-      ...s,
-      label: fmtAxis(s.ts, range),
-    }));
   }, [genRows, consRows, range]);
 
   const ZoomButton = ({ k, label }: { k: RangeKey; label: string }) => (
@@ -337,20 +259,6 @@ export function PowerChart({ cpf }: { cpf: string }) {
       className={`px-2.5 py-1.5 rounded-lg text-[11px] font-bold transition-colors border ${
         range === k
           ? "bg-green-500/20 text-green-300 border-green-500/40"
-          : "bg-transparent text-gray-300 border-gray-700 hover:bg-white/5"
-      }`}
-    >
-      {label}
-    </button>
-  );
-
-  const ModeButton = ({ m, label }: { m: Mode; label: string }) => (
-    <button
-      type="button"
-      onClick={() => setMode(m)}
-      className={`px-2.5 py-1.5 rounded-lg text-[11px] font-bold transition-colors border ${
-        mode === m
-          ? "bg-blue-500/20 text-blue-200 border-blue-500/40"
           : "bg-transparent text-gray-300 border-gray-700 hover:bg-white/5"
       }`}
     >
@@ -384,6 +292,7 @@ export function PowerChart({ cpf }: { cpf: string }) {
 
   if (chartData.length === 0) {
     const label = range === "24h" ? "24 horas" : "30 dias";
+
     return (
       <div className="h-20 flex flex-col gap-2 items-center justify-center text-gray-600 text-xs">
         <div>Sem dados nas últimas {label}.</div>
@@ -395,35 +304,16 @@ export function PowerChart({ cpf }: { cpf: string }) {
     );
   }
 
-  const yTick = (value: any) =>
-    mode === "BRL_ECON"
-      ? `R$ ${Number(value).toFixed(0)}`
-      : `${Number(value).toFixed(0)} W`;
+  const yTick = (value: any) => `${Number(value).toFixed(0)} W`;
 
   return (
     <div className="w-full">
-      <div className="flex items-center justify-between mb-2 gap-3">
-        <div className="text-[11px] text-gray-400">
-          <span className="ml-3">
-            Tarifa Média Equatorial Maranhão:{" "}
-            <span className="text-gray-200 font-semibold">
-              R$ {FIXED_TARIFA.toFixed(2)}/kWh
-            </span>
-          </span>
-        </div>
-
-        <div className="flex gap-2">
-          <ZoomButton k="24h" label="24h" />
-          <ZoomButton k="30d" label="30d" />
-        </div>
+      <div className="flex items-center justify-end mb-2 gap-2">
+        <ZoomButton k="24h" label="24h" />
+        <ZoomButton k="30d" label="30d" />
       </div>
 
-      <div className="flex items-center justify-between mb-2 gap-3">
-        <div className="flex gap-2">
-          <ModeButton m="W" label="W" />
-          <ModeButton m="BRL_ECON" label="Economia em R$" />
-        </div>
-
+      <div className="flex items-center justify-end mb-2">
         <div className="text-[11px] text-gray-500 text-right">
           Período:{" "}
           <span className="text-gray-200 font-semibold">
@@ -468,12 +358,10 @@ export function PowerChart({ cpf }: { cpf: string }) {
                 ? `Atualizado em: ${fmtTooltip(ts)}`
                 : "Atualizado em: --";
             }}
-            formatter={(value: any, name: string) => {
-              if (mode === "BRL_ECON") {
-                return [`R$ ${Number(value).toFixed(2)}`, name];
-              }
-              return [`${Number(value).toFixed(0)} W`, name];
-            }}
+            formatter={(value: any, name: string) => [
+              `${Number(value).toFixed(0)} W`,
+              name,
+            ]}
             contentStyle={{
               backgroundColor: "#1a2942",
               border: "1px solid #334155",
@@ -487,39 +375,25 @@ export function PowerChart({ cpf }: { cpf: string }) {
             iconType="line"
           />
 
-          {mode === "BRL_ECON" ? (
-            <Area
-              type="monotone"
-              dataKey="brl_econ"
-              name="Economia (acum.)"
-              stroke="#22c55e"
-              strokeWidth={2}
-              fillOpacity={1}
-              fill="url(#genGradient)"
-            />
-          ) : (
-            <>
-              <Area
-                type="monotone"
-                dataKey="gen_w"
-                name="Geração (W)"
-                stroke="#22c55e"
-                strokeWidth={2}
-                fillOpacity={1}
-                fill="url(#genGradient)"
-              />
+          <Area
+            type="monotone"
+            dataKey="gen_w"
+            name="Geração (W)"
+            stroke="#22c55e"
+            strokeWidth={2}
+            fillOpacity={1}
+            fill="url(#genGradient)"
+          />
 
-              <Area
-                type="monotone"
-                dataKey="cons_w"
-                name="Consumo (W)"
-                stroke="#f59e0b"
-                strokeWidth={2}
-                fillOpacity={1}
-                fill="url(#consGradient)"
-              />
-            </>
-          )}
+          <Area
+            type="monotone"
+            dataKey="cons_w"
+            name="Consumo (W)"
+            stroke="#f59e0b"
+            strokeWidth={2}
+            fillOpacity={1}
+            fill="url(#consGradient)"
+          />
         </AreaChart>
       </ResponsiveContainer>
     </div>

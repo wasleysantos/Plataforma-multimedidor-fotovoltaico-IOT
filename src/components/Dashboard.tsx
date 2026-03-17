@@ -807,70 +807,68 @@ export function Dashboard({ user, onLogout }: DashboardProps) {
               )}
             </div>
 
-            <div className="mb-4 rounded-2xl bg-zinc-900/60 border border-zinc-800 p-4 backdrop-blur-md shadow-lg">
-              <div className="flex items-center justify-between gap-4">
-                <div className="flex flex-col space-y-1">
-                  <span className="text-[11px] suppercase tracking-wider text-gray-300">
-                    Monitorando:
-                  </span>
+            <div className="mb-4 rounded-2xl bg-[#1a2942] border border-green-500/20 border-b-4 border-b-green-400 p-4 backdrop-blur-md shadow-lg shadow-green-500/10">
+  <div className="flex items-center justify-between gap-4">
+    <div className="flex flex-col space-y-1">
+      <span className="text-[11px] uppercase tracking-wider text-gray-300">
+        Monitorando:
+      </span>
 
-                  <div className="flex items-center gap-2">
-                    <span className="text-base font-semibold text-gray-300">
-                      CPF:
-                    </span>
-                    <span className="text-base font-semibold text-green-400">
-                      {targetCPF ? maskCPF(targetCPF) : "Aguardando CPF..."}
-                    </span>
-                  </div>
+      <div className="flex items-center gap-2">
+        <span className="text-base font-semibold text-gray-300">
+          CPF:
+        </span>
+        <span className="text-base font-semibold text-green-400">
+          {targetCPF ? maskCPF(targetCPF) : "Aguardando CPF..."}
+        </span>
+      </div>
 
-                  {targetCPF && (
-                    <>
-                      <div className="text-sm text-green-400">
-                        {loadingName
-                          ? "Carregando nome..."
-                          : personName
-                            ? personName
-                            : nameNotFound
-                              ? "CPF não encontrado"
-                              : ""}
-                      </div>
+      {targetCPF && (
+        <>
+          <div className="text-sm text-green-400">
+            {loadingName
+              ? "Carregando nome..."
+              : personName
+                ? personName
+                : nameNotFound
+                  ? "CPF não encontrado"
+                  : ""}
+          </div>
 
-                      <div className="flex flex-col gap-1 text-[11px] text-gray-400">
-                        <div className="flex items-center gap-1">
-                          <span className="w-2 h-2 rounded-full bg-green-500 animate-pulse"></span>
-                          Última geração:
-                          <span className="text-gray-300 font-medium text-green-400">
-                            {lastGenUpdate}
-                          </span>
-                        </div>
-
-                        <div className="flex items-center gap-1">
-                          <span className="w-2 h-2 rounded-full bg-yellow-400 animate-pulse"></span>
-                          Último consumo:
-                          <span className="text-gray-300 font-medium text-yellow-400">
-                            {lastConsUpdate}
-                          </span>
-                        </div>
-                      </div>
-                    </>
-                  )}
-                </div>
-
-                <div className="text-right">
-                  <div className="text-2xl font-bold text-white tracking-tight">
-                    {timeText}
-                  </div>
-                  <div className="text-xs text-gray-400 capitalize">
-                    {dateText}
-                  </div>
-                </div>
-              </div>
+          <div className="flex flex-col gap-1 text-[11px] text-gray-400">
+            <div className="flex items-center gap-1">
+              <span className="w-2 h-2 rounded-full bg-green-500 animate-pulse"></span>
+              Última geração:
+              <span className="text-gray-300 font-medium text-green-400">
+                {lastGenUpdate}
+              </span>
             </div>
 
-            <div className="flex items-center justify-between mb-3">
-              <h3 className="text-white text-sm font-semibold">
-                Resumo energético
-              </h3>
+            <div className="flex items-center gap-1">
+              <span className="w-2 h-2 rounded-full bg-yellow-400 animate-pulse"></span>
+              Último consumo:
+              <span className="text-gray-300 font-medium text-yellow-400">
+                {lastConsUpdate}
+              </span>
+            </div>
+          </div>
+        </>
+      )}
+    </div>
+
+    <div className="text-right">
+      <div className="text-2xl font-bold text-white tracking-tight">
+        {timeText}
+      </div>
+      <div className="text-xs text-gray-400 capitalize">
+        {dateText}
+      </div>
+    </div>
+  </div>
+</div>
+
+            <div className="flex items-center gap-3 mb-4">
+              
 
               <div className="flex bg-[#1a2942] rounded-xl p-1 border border-gray-700">
                 <button
